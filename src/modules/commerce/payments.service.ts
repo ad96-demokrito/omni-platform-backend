@@ -259,7 +259,7 @@ export async function createStripePaymentLink(
 
   const params = new URLSearchParams();
   params.append("mode", "payment");
-  params.append("line_items[0][price_data][currency]", (order.currency || "USD").toLowerCase());
+  params.append("line_items[0][price_data][currency]", (order.currency || "INR").toLowerCase());
   params.append(
     "line_items[0][price_data][product_data][name]",
     `Order #${order.order_number}`
@@ -400,7 +400,7 @@ export async function handleStripeWebhook(body: any): Promise<{ success: boolean
     const tenantId = dataObject?.metadata?.tenantId;
     const paymentId = dataObject?.payment_intent || dataObject?.id;
     const amount = (dataObject?.amount_total || dataObject?.amount || 0) / 100;
-    const currency = dataObject?.currency?.toUpperCase() || "USD";
+    const currency = dataObject?.currency?.toUpperCase() || "INR";
 
     if (orderId) {
       // Find tenant_id if not present in metadata

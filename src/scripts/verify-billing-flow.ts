@@ -29,7 +29,7 @@ async function runBillingVerification() {
       if (!resolved) {
         throw new Error(`Failed to resolve plan: ${planId}`);
       }
-      console.log(`     ✓ Plan '${planId}': Name="${resolved.name}", Monthly=$${resolved.priceMonthly}, Yearly=$${resolved.priceYearly}, Channels=${resolved.maxChannels}, Contacts=${resolved.maxContacts}`);
+      console.log(`     ✓ Plan '${planId}': Name="${resolved.name}", Monthly=₹${resolved.priceMonthly}, Yearly=₹${resolved.priceYearly}, Channels=${resolved.maxChannels}, Contacts=${resolved.maxContacts}`);
     }
     console.log("✅ Plan Resolution verified successfully.\n");
 
@@ -45,7 +45,7 @@ async function runBillingVerification() {
       successUrl: "http://localhost:5173/settings?checkout=success",
       cancelUrl: "http://localhost:5173/settings?checkout=cancel",
     });
-    console.log(`     ✓ Stripe Session: ID=${stripeSession.sessionId}, Gateway=${stripeSession.gateway}, Amount=$${stripeSession.amount} ${stripeSession.currency}, isSandbox=${stripeSession.isSandbox}`);
+    console.log(`     ✓ Stripe Session: ID=${stripeSession.sessionId}, Gateway=${stripeSession.gateway}, Amount=₹${stripeSession.amount} ${stripeSession.currency}, isSandbox=${stripeSession.isSandbox}`);
 
     // 3b. Razorpay Checkout
     const razorpaySession = await BillingService.createCheckoutSession({
@@ -54,7 +54,7 @@ async function runBillingVerification() {
       billingCycle: "yearly",
       gateway: "razorpay",
     });
-    console.log(`     ✓ Razorpay Session: ID=${razorpaySession.sessionId}, Gateway=${razorpaySession.gateway}, Amount=$${razorpaySession.amount} ${razorpaySession.currency}, isSandbox=${razorpaySession.isSandbox}`);
+    console.log(`     ✓ Razorpay Session: ID=${razorpaySession.sessionId}, Gateway=${razorpaySession.gateway}, Amount=₹${razorpaySession.amount} ${razorpaySession.currency}, isSandbox=${razorpaySession.isSandbox}`);
 
     // 3c. Sandbox Checkout
     const sandboxSession = await BillingService.createCheckoutSession({
@@ -63,7 +63,7 @@ async function runBillingVerification() {
       billingCycle: "monthly",
       gateway: "sandbox",
     });
-    console.log(`     ✓ Sandbox Session: ID=${sandboxSession.sessionId}, Gateway=${sandboxSession.gateway}, Amount=$${sandboxSession.amount} ${sandboxSession.currency}`);
+    console.log(`     ✓ Sandbox Session: ID=${sandboxSession.sessionId}, Gateway=${sandboxSession.gateway}, Amount=₹${sandboxSession.amount} ${sandboxSession.currency}`);
     console.log("✅ Multi-gateway session generation verified.\n");
 
     // 4. Test Payment Verification & Upgrade to PRO Plan (Monthly)
@@ -125,7 +125,7 @@ async function runBillingVerification() {
     const invoices = await BillingService.getInvoices(tenant.id);
     console.log(`     ✓ Retrieved ${invoices.length} invoices for tenant:`);
     for (const inv of invoices.slice(0, 5)) {
-      console.log(`        - [${inv.invoiceNumber}] ${inv.planName} | $${inv.amount} ${inv.currency} | ${inv.billingCycle} | ${inv.paymentMethod} | Status: ${inv.status}`);
+      console.log(`        - [${inv.invoiceNumber}] ${inv.planName} | ₹${inv.amount} ${inv.currency} | ${inv.billingCycle} | ${inv.paymentMethod} | Status: ${inv.status}`);
     }
     if (invoices.length < 2) {
       throw new Error("Expected at least 2 invoices in ledger!");

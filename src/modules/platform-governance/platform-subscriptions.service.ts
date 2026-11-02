@@ -280,7 +280,7 @@ export async function recordSubscriptionPayment(params: {
     tenantId,
     planId,
     amount,
-    currency = "USD",
+    currency = "INR",
     billingCycle = "monthly",
     paymentMethod = "stripe",
     transactionReference,

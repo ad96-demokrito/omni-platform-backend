@@ -62,7 +62,7 @@ function mapPlanRow(r: any): PlatformPlanItem {
     description: r.description,
     priceMonthly: parseFloat(r.price_monthly || "0"),
     priceYearly: parseFloat(r.price_yearly || "0"),
-    currency: r.currency || "USD",
+    currency: r.currency || "INR",
     maxChannels: parseInt(r.max_channels || "1", 10),
     maxContacts: parseInt(r.max_contacts || "500", 10),
     maxMonthlyMessages: parseInt(r.max_monthly_messages || "2000", 10),
@@ -130,7 +130,7 @@ export async function createPlatformPlan(dto: CreatePlatformPlanDto): Promise<Pl
 
   const priceMonthly = Math.max(0, dto.priceMonthly || 0);
   const priceYearly = dto.priceYearly !== undefined ? Math.max(0, dto.priceYearly) : priceMonthly * 10;
-  const currency = (dto.currency || "USD").toUpperCase();
+  const currency = (dto.currency || "INR").toUpperCase();
   const maxChannels = Math.max(1, dto.maxChannels || 1);
   const maxContacts = Math.max(10, dto.maxContacts || 500);
   const maxMonthlyMessages = Math.max(100, dto.maxMonthlyMessages || 2000);

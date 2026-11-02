@@ -34,7 +34,7 @@ export const PLAN_TIERS: Record<string, PlanConfig> = {
     description: "Ideal for testing and single-channel experimentation",
     priceMonthly: 0,
     priceYearly: 0,
-    currency: "USD",
+    currency: "INR",
     maxChannels: 1,
     maxContacts: 500,
     maxMonthlyMessages: 2000,
@@ -48,7 +48,7 @@ export const PLAN_TIERS: Record<string, PlanConfig> = {
     description: "For small teams scaling messaging and customer service",
     priceMonthly: 29,
     priceYearly: 290,
-    currency: "USD",
+    currency: "INR",
     maxChannels: 3,
     maxContacts: 3000,
     maxMonthlyMessages: 15000,
@@ -69,7 +69,7 @@ export const PLAN_TIERS: Record<string, PlanConfig> = {
     description: "For fast-growing organizations requiring high capacity & AI agents",
     priceMonthly: 99,
     priceYearly: 990,
-    currency: "USD",
+    currency: "INR",
     maxChannels: 10,
     maxContacts: 25000,
     maxMonthlyMessages: 100000,
@@ -91,7 +91,7 @@ export const PLAN_TIERS: Record<string, PlanConfig> = {
     description: "Dedicated infrastructure, SLA guarantees, and limitless capacity",
     priceMonthly: 299,
     priceYearly: 2990,
-    currency: "USD",
+    currency: "INR",
     maxChannels: 50,
     maxContacts: 500000,
     maxMonthlyMessages: 1000000,
@@ -387,7 +387,7 @@ export class BillingService {
     const priceMonthly = plan.priceMonthly || 0;
     const priceYearly = plan.priceYearly !== undefined ? plan.priceYearly : priceMonthly * 10;
     const amount = billingCycle === "yearly" ? priceYearly : priceMonthly;
-    const currency = (plan.currency || "USD").toUpperCase();
+    const currency = (plan.currency || "INR").toUpperCase();
 
     // Free plan check - activate immediately
     if (amount <= 0) {
@@ -499,7 +499,7 @@ export class BillingService {
           const amountInSubunits = Math.round(amount * 100);
           const rzpPayload = {
             amount: amountInSubunits,
-            currency: currency === "USD" ? "USD" : currency,
+            currency: currency,
             accept_partial: false,
             description: `Omni Platform - ${plan.name} Plan (${billingCycle})`,
             notify: { sms: false, email: false },
@@ -606,7 +606,7 @@ export class BillingService {
     const priceMonthly = plan.priceMonthly || 0;
     const priceYearly = plan.priceYearly !== undefined ? plan.priceYearly : priceMonthly * 10;
     const amount = billingCycle === "yearly" ? priceYearly : priceMonthly;
-    const currency = (plan.currency || "USD").toUpperCase();
+    const currency = (plan.currency || "INR").toUpperCase();
 
     // Record immutable subscription payment and extend lifecycle
     const paymentResult = await recordSubscriptionPayment({
