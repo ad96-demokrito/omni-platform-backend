@@ -19,7 +19,7 @@ export interface FlowRun {
   flow_id: string;
   current_node_id: string | null;
   variables: Record<string, any>;
-  status: "running" | "completed" | "handed_off";
+  status: "running" | "completed" | "handed_off" | "failed";
   /** Set when the run was started by a campaign; answers are then recorded per recipient. */
   campaign_id: string | null;
   campaign_recipient_id: string | null;
@@ -143,6 +143,14 @@ export async function attachFlowRunToCampaign(
     `UPDATE flow_runs SET campaign_id = $2, campaign_recipient_id = $3, updated_at = now()
      WHERE id = $1 AND campaign_id IS NULL`,
     [flowRunId, campaignId, campaignRecipientId]
+  );
+}
+
+/** Ends a run without touching its state, so it no longer counts as the conversation's active run. */
+export async function endFlowRun(flowRunId: string, status: "completed" | "failed"): Promise<void> {
+  await query(
+    `UPDATE flow_runs SET status = $2, updated_at = now() WHERE id = $1 AND status = 'running'`,
+    [flowRunId, status]
   );
 }
 

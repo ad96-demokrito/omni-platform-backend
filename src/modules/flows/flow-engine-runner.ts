@@ -7,6 +7,7 @@ import {
   createFlowRun,
   attachFlowRunToCampaign,
   updateFlowRun,
+  endFlowRun,
   getFlow,
 } from "./flows.service";
 import { advanceFlow, resumeFlowOnDeliveryStatus } from "./flow-engine";
@@ -41,6 +42,12 @@ export async function runFlowForConversation(params: {
 
   const result = await withLock<FlowRunOutcome>(`flow-lock:${conversationId}`, 10_000, async () => {
     let flowRun = await getActiveFlowRun(conversationId);
+
+    // A campaign's flow always wins over a leftover run of another flow on the same conversation.
+    if (flowRun && campaign && defaultFlowId && flowRun.flow_id !== defaultFlowId) {
+      await endFlowRun(flowRun.id, "completed");
+      flowRun = null;
+    }
 
     if (!flowRun) {
       // Check if conversation was handed off to a human agent
@@ -112,27 +119,36 @@ export async function runFlowForConversation(params: {
     // The first message of the pass is the one a campaign recipient is tracked by
     let firstProviderMessageId: string | undefined;
 
-    for (const msg of advance.outboundMessages) {
-      if (msg.type === "text") {
-        const sent = await sendOutboundMessage({ tenantId, conversationId, text: msg.text });
-        lastProviderMessageId = sent.provider_message_id;
-        firstProviderMessageId ??= sent.provider_message_id;
-      } else if (msg.type === "template") {
-        const sent = await sendOutboundMessage({
-          tenantId,
-          conversationId,
-          type: "template",
-          templateName: msg.templateName,
-          templateLanguage: msg.templateLanguage,
-          templateParams: msg.templateParams,
-          headerType: msg.headerType,
-          headerValue: msg.headerValue,
-          mediaStorageKey: msg.mediaStorageKey,
-          filename: msg.filename,
-        });
-        lastProviderMessageId = sent.provider_message_id;
-        firstProviderMessageId ??= sent.provider_message_id;
+    try {
+      for (const msg of advance.outboundMessages) {
+        if (msg.type === "text") {
+          const sent = await sendOutboundMessage({ tenantId, conversationId, text: msg.text });
+          lastProviderMessageId = sent.provider_message_id;
+          firstProviderMessageId ??= sent.provider_message_id;
+        } else if (msg.type === "template") {
+          const sent = await sendOutboundMessage({
+            tenantId,
+            conversationId,
+            type: "template",
+            templateName: msg.templateName,
+            templateLanguage: msg.templateLanguage,
+            templateParams: msg.templateParams,
+            headerType: msg.headerType,
+            headerValue: msg.headerValue,
+            mediaStorageKey: msg.mediaStorageKey,
+            filename: msg.filename,
+          });
+          lastProviderMessageId = sent.provider_message_id;
+          firstProviderMessageId ??= sent.provider_message_id;
+        }
       }
+    } catch (err) {
+      // The send was rejected (e.g. 24h window closed, unreachable header media). Don't leave the run
+      // "running" — a later campaign would resume this flow instead of starting its own.
+      await endFlowRun(flowRun.id, "failed").catch((e) => {
+        console.error(`[flow-engine] could not mark run ${flowRun!.id} failed:`, e);
+      });
+      throw err;
     }
 
     const updatedVariables = { ...advance.variables };
@@ -223,6 +239,19 @@ export async function handleDeliveryStatusCallback(params: {
       normalizedStatus,
       { code: errorCode, message: errorMessage }
     );
+
+    // The flow's own message failed and the node has no failure path: end the run, otherwise it
+    // stays "running" and the next campaign to this contact resumes it instead of its own flow.
+    if (
+      status === "failed" &&
+      flowRun.variables?._last_wamid === params.providerMessageId &&
+      advance.outboundMessages.length === 0 &&
+      advance.nextNodeId === flowRun.current_node_id
+    ) {
+      console.warn(`[flow-engine] message failed (${errorCode ?? "unknown"}) — ending flow run ${flowRun.id}`);
+      await endFlowRun(flowRun.id, "failed");
+      return;
+    }
 
     // Send any subsequent messages along the chosen path
     for (const msg of advance.outboundMessages) {

@@ -1,3 +1,5 @@
+import { isMetaUploadHandle, uploadHeaderSample } from "./meta-upload";
+
 export interface TemplateButton {
   type: "QUICK_REPLY" | "URL" | "PHONE_NUMBER" | "COPY_CODE" | string;
   text?: string;
@@ -11,6 +13,8 @@ export interface TemplateButton {
 export interface TemplateComponent {
   type: "HEADER" | "BODY" | "FOOTER" | "BUTTONS";
   format?: "TEXT" | "IMAGE" | "VIDEO" | "DOCUMENT";
+  /** Object-storage key of the uploaded header sample; converted to a Meta upload handle on create. */
+  mediaStorageKey?: string;
   text?: string;
   buttons?: TemplateButton[];
   example?: {
@@ -80,7 +84,7 @@ export async function createTemplate(
   console.log(`[Templates] Submitting message template "${template.name}" to Meta WABA: ${wabaId}...`);
 
   // Normalize components for Meta Cloud API
-  const formattedComponents = (template.components || []).map((comp) => {
+  const formattedComponents = await Promise.all((template.components || []).map(async (comp) => {
     const formatted: any = { type: comp.type };
 
     if (comp.type === "HEADER") {
@@ -88,10 +92,20 @@ export async function createTemplate(
       if (formatted.format === "TEXT" && comp.text) {
         formatted.text = comp.text;
       }
-      if (comp.example) {
-        formatted.example = {};
-        if (comp.example.header_text?.length) formatted.example.header_text = comp.example.header_text;
-        if (comp.example.header_handle?.length) formatted.example.header_handle = comp.example.header_handle;
+      if (formatted.format !== "TEXT") {
+        // Media header: Meta needs an upload handle, not a URL.
+        const given = comp.example?.header_handle?.[0];
+        const handle = isMetaUploadHandle(given)
+          ? given!
+          : await uploadHeaderSample({
+              accessToken,
+              apiBaseUrl,
+              mediaStorageKey: comp.mediaStorageKey,
+              source: given,
+            });
+        formatted.example = { header_handle: [handle] };
+      } else if (comp.example?.header_text?.length) {
+        formatted.example = { header_text: comp.example.header_text };
       }
     } else if (comp.type === "BODY") {
       formatted.text = comp.text;
@@ -126,7 +140,7 @@ export async function createTemplate(
     }
 
     return formatted;
-  });
+  }));
 
   const payload = {
     name: template.name,
@@ -146,8 +160,10 @@ export async function createTemplate(
     let errMsg = `Meta API error (${response.status})`;
     try {
       const errJson = JSON.parse(errText);
-      if (errJson?.error?.message) {
-        errMsg = `Meta: ${errJson.error.message}`;
+      const e = errJson?.error;
+      if (e?.message) {
+        const detail = [e.error_user_title, e.error_user_msg].filter(Boolean).join(" — ");
+        errMsg = `Meta: ${e.message}${detail ? ` (${detail})` : ""}`;
       }
     } catch {
       errMsg = `Failed to create template (${response.status}): ${errText}`;
