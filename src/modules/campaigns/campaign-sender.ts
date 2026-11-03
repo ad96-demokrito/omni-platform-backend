@@ -10,8 +10,17 @@ import {
   markRecipientFailed,
   advanceDripRecipient,
   completeDripRecipient,
+  startDripCampaign,
+  finalizeFinishedDripCampaigns,
+  Campaign,
 } from "./campaigns.service";
-import { BroadcastDefinition, DripDefinition, FlowCampaignDefinition, interpolate } from "./campaigns.types";
+import {
+  BroadcastDefinition,
+  DripDefinition,
+  FlowCampaignDefinition,
+  interpolate,
+  normalizeDripSteps,
+} from "./campaigns.types";
 import { findOrCreateOpenConversation } from "../conversations/conversations.service";
 import { runFlowForConversation, FlowRunSkipReason } from "../flows/flow-engine-runner";
 import { getFlow } from "../flows/flows.service";
@@ -241,6 +250,10 @@ export async function processDueDripSteps(): Promise<{ processed: number; failed
         },
       };
       const text = interpolate(step.text, recipientVars);
+      if (!text.trim()) {
+        // Meta rejects an empty text.body; fail with a reason an operator can act on instead.
+        throw new Error(`Drip step ${recipient.current_step + 1} has no message text`);
+      }
       await adapter.send(
         { toExternalContactId: recipient.external_id, type: "text", text },
         channel.credentials || {}
@@ -262,5 +275,25 @@ export async function processDueDripSteps(): Promise<{ processed: number; failed
     }
   }
 
+  await finalizeFinishedDripCampaigns();
+
   return { processed, failed };
+}
+
+/**
+ * Starts a draft drip campaign. Step 1 goes out after its own delay (immediately when 0); the
+ * scheduler in index.ts sends the rest. Returns null when the campaign was already started.
+ * Throws when the saved steps are invalid, so a broken campaign never starts.
+ */
+export async function startDrip(
+  tenantId: string,
+  campaign: Campaign
+): Promise<{ scheduled: number } | null> {
+  const normalized = normalizeDripSteps((campaign.definition as Partial<DripDefinition>).steps);
+  if ("error" in normalized) throw new Error(normalized.error);
+
+  const channel = await getChannelWithCredentials(tenantId, campaign.channel_id);
+  if (!channel) throw new Error("Channel not found");
+
+  return startDripCampaign({ tenantId, campaignId: campaign.id, steps: normalized.steps });
 }

@@ -9,7 +9,8 @@ import {
   getCampaignRecipients,
   getCampaignAnalytics,
 } from "./campaigns.service";
-import { sendBroadcastNow } from "./campaign-sender";
+import { sendBroadcastNow, startDrip } from "./campaign-sender";
+import { DripStep, normalizeDripSteps } from "./campaigns.types";
 import {
   getCampaignExportData,
   buildCampaignExportWorkbook,
@@ -136,12 +137,16 @@ campaignsRouter.post(
       return res.status(400).json({ error: "broadcast definition requires a text, templateName, or flowId field" });
     }
 
-    if (type === "drip" && (!Array.isArray(definition?.steps) || definition.steps.length === 0)) {
-      return res.status(400).json({ error: "drip definition requires a non-empty steps array" });
+    let dripSteps: DripStep[] | undefined;
+    if (type === "drip") {
+      const normalized = normalizeDripSteps(definition?.steps);
+      if ("error" in normalized) return res.status(400).json({ error: normalized.error });
+      dripSteps = normalized.steps;
     }
 
     const mergedDefinition = {
       ...definition,
+      ...(dripSteps ? { steps: dripSteps } : {}),
       ...(type === "flow" && req.body.flowId ? { flowId: req.body.flowId } : {}),
       ...(type === "broadcast" && req.body.message ? { text: req.body.message } : {}),
       ...(type === "broadcast" && req.body.templateName ? { templateName: req.body.templateName } : {}),
@@ -171,14 +176,25 @@ campaignsRouter.post(
 );
 
 /**
- * Trigger send for broadcast or flow campaigns.
+ * Trigger send for a broadcast or flow campaign, or start a draft drip sequence.
+ * A drip answers { sent: 0, failed: 0, started: true, scheduled } because its steps go out later.
  */
 campaignsRouter.post(
   "/:id/send",
   requireRole("owner", "admin"),
   asyncHandler(async (req: AuthedRequest, res: Response) => {
     try {
-      const result = await sendBroadcastNow(req.auth!.tenantId, req.params.id);
+      const tenantId = req.auth!.tenantId;
+      const campaign = await getCampaign(tenantId, req.params.id);
+      if (!campaign) return res.status(404).json({ error: "Campaign not found" });
+
+      if (campaign.type === "drip") {
+        const started = await startDrip(tenantId, campaign);
+        if (!started) return res.status(409).json({ error: "This drip campaign has already been started" });
+        return res.json({ sent: 0, failed: 0, started: true, scheduled: started.scheduled });
+      }
+
+      const result = await sendBroadcastNow(tenantId, req.params.id);
       res.json(result);
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : "Failed to send campaign" });

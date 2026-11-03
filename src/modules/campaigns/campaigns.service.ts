@@ -1,5 +1,5 @@
 import { query, queryOne, withTransaction } from "../../db/pool";
-import { BroadcastDefinition, DripDefinition, FlowCampaignDefinition } from "./campaigns.types";
+import { BroadcastDefinition, DripDefinition, DripStep, FlowCampaignDefinition } from "./campaigns.types";
 import { getContactIdsByFilter } from "../contacts/contacts.service";
 
 export interface Campaign {
@@ -376,8 +376,69 @@ export async function getDueDripRecipients(): Promise<
      FROM campaign_recipients cr
      JOIN contacts c ON c.id = cr.contact_id
      JOIN campaigns camp ON camp.id = cr.campaign_id
-     WHERE camp.type = 'drip' AND cr.status = 'pending' AND cr.next_send_at <= now()`
+     WHERE camp.type = 'drip' AND camp.status = 'sending'
+       AND cr.status = 'pending' AND cr.next_send_at <= now()`
   );
+}
+
+/**
+ * Starts a draft drip campaign: moves it to 'sending' and schedules every pending recipient's
+ * first step (honouring step 1's delay). Saves the normalized steps too, so drips created before
+ * the `message` -> `text` fix run correctly. Returns null when the campaign is not a draft
+ * (already started), which makes a double click harmless.
+ */
+export async function startDripCampaign(params: {
+  tenantId: string;
+  campaignId: string;
+  steps: DripStep[];
+}): Promise<{ scheduled: number } | null> {
+  const { tenantId, campaignId, steps } = params;
+  return withTransaction(async (client) => {
+    const started = await client.query(
+      `UPDATE campaigns
+       SET status = 'sending', definition = jsonb_set(definition, '{steps}', $3::jsonb)
+       WHERE id = $1 AND tenant_id = $2 AND type = 'drip' AND status = 'draft'
+       RETURNING id`,
+      [campaignId, tenantId, JSON.stringify(steps)]
+    );
+    if (started.rows.length === 0) return null;
+
+    const scheduled = await client.query(
+      `UPDATE campaign_recipients
+       SET next_send_at = now() + ($2::float8 * interval '1 hour'), updated_at = now()
+       WHERE campaign_id = $1 AND status = 'pending'`,
+      [campaignId, steps[0].delayHours]
+    );
+    return { scheduled: scheduled.rowCount ?? 0 };
+  });
+}
+
+/**
+ * Closes drip campaigns whose recipients have all finished (no step still pending):
+ * completed, partially_failed, or failed when every recipient failed.
+ */
+export async function finalizeFinishedDripCampaigns(): Promise<number> {
+  const rows = await query<{ id: string }>(
+    `UPDATE campaigns c
+     SET status = CASE
+       WHEN t.failed = 0 THEN 'completed'
+       WHEN t.failed >= t.total THEN 'failed'
+       ELSE 'partially_failed'
+     END
+     FROM (
+       SELECT cr.campaign_id,
+              COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE cr.status = 'failed')::int AS failed,
+              COUNT(*) FILTER (WHERE cr.status = 'pending')::int AS pending
+       FROM campaign_recipients cr
+       JOIN campaigns camp ON camp.id = cr.campaign_id
+       WHERE camp.type = 'drip' AND camp.status = 'sending'
+       GROUP BY cr.campaign_id
+     ) t
+     WHERE c.id = t.campaign_id AND t.pending = 0
+     RETURNING c.id`
+  );
+  return rows.length;
 }
 
 /**

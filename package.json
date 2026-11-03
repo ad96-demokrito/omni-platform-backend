@@ -10,7 +10,9 @@
     "migrate:prod": "node dist/db/migrate.js",
     "backfill:campaign-delivery": "ts-node-dev --transpile-only src/scripts/backfill-campaign-delivery.ts",
     "backfill:campaign-delivery:prod": "node dist/scripts/backfill-campaign-delivery.js",
-    "reindex:search": "ts-node-dev --transpile-only src/scripts/reindex-search.ts",
+    "repair:drips": "ts-node-dev --transpile-only src/scripts/repair-drip-campaigns.ts",
+    "repair:drips:prod": "node dist/scripts/repair-drip-campaigns.js",
+    "reindex:search":"ts-node-dev --transpile-only src/scripts/reindex-search.ts",
     "reindex:search:prod": "node dist/scripts/reindex-search.js"
   },
   "dependencies": {
