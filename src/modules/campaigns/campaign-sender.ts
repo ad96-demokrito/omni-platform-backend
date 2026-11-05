@@ -22,12 +22,16 @@ import {
   normalizeDripSteps,
 } from "./campaigns.types";
 import { findOrCreateOpenConversation } from "../conversations/conversations.service";
+import { sendOutboundMessage } from "../messages/messages.service";
+import { logger } from "../../utils/logger";
 import { runFlowForConversation, FlowRunSkipReason } from "../flows/flow-engine-runner";
 import { getFlow } from "../flows/flows.service";
 import { getMediaDownloadUrl } from "../../db/object-storage";
 import { syncRecipientWithMessageStatus } from "./campaign-delivery-sync";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const dripLog = logger.child({ module: "drip-scheduler" });
 
 /**
  * Marks a recipient as accepted by the provider and stores the provider message id. A delivery
@@ -233,7 +237,6 @@ export async function processDueDripSteps(): Promise<{ processed: number; failed
         continue;
       }
 
-      const adapter = getAdapter(channel.type);
       const recipientVars = {
         name: recipient.name || "",
         phone: recipient.external_id || "",
@@ -254,10 +257,24 @@ export async function processDueDripSteps(): Promise<{ processed: number; failed
         // Meta rejects an empty text.body; fail with a reason an operator can act on instead.
         throw new Error(`Drip step ${recipient.current_step + 1} has no message text`);
       }
-      await adapter.send(
-        { toExternalContactId: recipient.external_id, type: "text", text },
-        channel.credentials || {}
-      );
+
+      // Send through the conversation, not straight through the adapter, so the step is stored as an
+      // outbound message: it then appears in the team inbox and picks up delivered/read receipts.
+      const conversation = await findOrCreateOpenConversation({
+        tenantId: campaign.tenant_id,
+        contactId: recipient.contact_id,
+        channelId: campaign.channel_id,
+      });
+      await sendOutboundMessage({
+        tenantId: campaign.tenant_id,
+        conversationId: conversation.id,
+        text,
+      });
+      dripLog.info("drip step sent and stored in the inbox", {
+        campaignId: campaign.id,
+        step: recipient.current_step + 1,
+        conversationId: conversation.id,
+      });
 
       const nextStepIndex = recipient.current_step + 1;
       const nextStep = definition.steps[nextStepIndex];
