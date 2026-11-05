@@ -10,7 +10,7 @@ import {
 } from "../conversations/conversations.service";
 import { getChannelWithCredentials } from "../channels/channels.service";
 import { getAdapter } from "../channels/channel-registry";
-import { getMediaDownloadUrl } from "../../db/object-storage";
+import { getMediaDownloadUrl, resolveHeaderMediaUrl } from "../../db/object-storage";
 import { indexMessage } from "../search/search.service";
 import { emitRealtimeEvent } from "../realtime/websocket.service";
 import { dispatchWebhookEvent } from "../webhooks/outgoing-webhooks.service";
@@ -257,10 +257,7 @@ export async function sendOutboundMessage(params: {
   if (type === "template") {
     // Send WhatsApp template message
     if (!templateName) throw new Error("templateName is required for template messages");
-    let resolvedHeaderValue = headerValue;
-    if (!resolvedHeaderValue && mediaStorageKey) {
-      resolvedHeaderValue = await getMediaDownloadUrl(mediaStorageKey);
-    }
+    const resolvedHeaderValue = await resolveHeaderMediaUrl(mediaStorageKey, headerValue);
     const result = await adapter.send(
       {
         toExternalContactId: conversation.contact_external_id,
@@ -310,7 +307,8 @@ export async function sendOutboundMessage(params: {
       templateLanguage,
       templateParams,
       headerType,
-      headerValue: headerValue || (mediaStorageKey ? `/api/media/file?key=${encodeURIComponent(mediaStorageKey)}` : undefined),
+      // Stored with the message for the inbox preview, so it must not be a URL that expires.
+      headerValue: mediaStorageKey ? `/api/media/file?key=${encodeURIComponent(mediaStorageKey)}` : headerValue,
       mediaStorageKey,
       filename,
     };

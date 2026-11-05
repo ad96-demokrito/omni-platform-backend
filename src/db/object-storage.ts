@@ -70,6 +70,28 @@ export async function getMediaDownloadUrl(key: string, expiresInSeconds = 3600):
   });
 }
 
+/** Meta downloads a template header right after the send request, so a day is plenty. */
+const HEADER_MEDIA_URL_TTL_SECONDS = 24 * 60 * 60;
+
+/**
+ * URL to hand to WhatsApp for a template's media header. An uploaded file is always signed fresh
+ * from its storage key: the URL saved on a flow node or campaign at upload time expires (7 days at
+ * most), so reusing it would break every send after that. `savedValue` is the pasted external URL or
+ * {{variable}} result, used when there is no storage key (or as a fallback if signing fails).
+ */
+export async function resolveHeaderMediaUrl(
+  mediaStorageKey: string | undefined,
+  savedValue: string | undefined
+): Promise<string | undefined> {
+  if (!mediaStorageKey) return savedValue;
+  try {
+    return await getMediaDownloadUrl(mediaStorageKey, HEADER_MEDIA_URL_TTL_SECONDS);
+  } catch (err) {
+    if (savedValue) return savedValue;
+    throw err;
+  }
+}
+
 /** Fetch media object body and headers directly for streaming through API */
 export async function getMediaObject(key: string): Promise<{ body: any; contentType: string; contentLength?: number }> {
   const s3 = getS3Client();

@@ -26,7 +26,7 @@ import { sendOutboundMessage } from "../messages/messages.service";
 import { logger } from "../../utils/logger";
 import { runFlowForConversation, FlowRunSkipReason } from "../flows/flow-engine-runner";
 import { getFlow } from "../flows/flows.service";
-import { getMediaDownloadUrl } from "../../db/object-storage";
+import { resolveHeaderMediaUrl } from "../../db/object-storage";
 import { syncRecipientWithMessageStatus } from "./campaign-delivery-sync";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -144,17 +144,13 @@ export async function sendBroadcastNow(
         } else if (definition.templateName) {
           // 2. WhatsApp Template broadcast with optional media header
           const adapter = getAdapter(channel.type);
-          let resolvedHeaderValue = definition.headerValue;
-          if (!resolvedHeaderValue && definition.mediaStorageKey) {
-            try {
-              resolvedHeaderValue = await getMediaDownloadUrl(definition.mediaStorageKey, 7 * 86400);
-            } catch (storageErr) {
-              console.warn(`[campaign-sender] Failed generating presigned URL for key ${definition.mediaStorageKey}:`, storageErr);
-              resolvedHeaderValue = `/api/media/file?key=${encodeURIComponent(definition.mediaStorageKey)}`;
-            }
-          } else if (resolvedHeaderValue) {
-            resolvedHeaderValue = interpolate(resolvedHeaderValue, recipientVars);
-          }
+          // An uploaded header is signed fresh from its storage key on every send; the URL saved at
+          // upload time expires, so a campaign sent days later would otherwise carry a dead link.
+          const resolvedHeaderValue = definition.mediaStorageKey
+            ? await resolveHeaderMediaUrl(definition.mediaStorageKey, definition.headerValue)
+            : definition.headerValue
+            ? interpolate(definition.headerValue, recipientVars)
+            : undefined;
 
           const interpolatedParams: Record<string, string> = {};
           if (definition.templateParams) {
