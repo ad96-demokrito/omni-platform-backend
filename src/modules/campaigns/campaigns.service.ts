@@ -1,6 +1,7 @@
 import { query, queryOne, withTransaction } from "../../db/pool";
 import { BroadcastDefinition, DripDefinition, DripStep, FlowCampaignDefinition } from "./campaigns.types";
 import { getContactIdsByFilter } from "../contacts/contacts.service";
+import { getDripSchedulerStatus } from "./drip-scheduler-status";
 
 export interface Campaign {
   id: string;
@@ -32,6 +33,8 @@ export interface CampaignRecipient {
   contact_id: string;
   status: "pending" | "sent" | "delivered" | "read" | "failed" | "completed";
   current_step: number;
+  /** Drip only: number of steps in the campaign, so the UI can show "1 of 2" */
+  steps_total?: number;
   next_send_at: string;
   last_error: string | null;
   error_code?: string | null;
@@ -201,11 +204,12 @@ export async function getCampaignRecipients(
   options: { status?: string; search?: string; limit?: number; offset?: number } = {}
 ): Promise<{ recipients: CampaignRecipient[]; total: number }> {
   // First verify campaign belongs to tenant
-  const campaign = await queryOne<{ id: string; channel_id: string }>(
-    "SELECT id, channel_id FROM campaigns WHERE id = $1 AND tenant_id = $2",
+  const campaign = await queryOne<{ id: string; channel_id: string; definition: Partial<DripDefinition> }>(
+    "SELECT id, channel_id, definition FROM campaigns WHERE id = $1 AND tenant_id = $2",
     [campaignId, tenantId]
   );
   if (!campaign) return { recipients: [], total: 0 };
+  const stepsTotal = campaign.definition?.steps?.length ?? 0;
 
   const { status, search, limit = 50, offset = 0 } = options;
   const conditions = ["cr.campaign_id = $1"];
@@ -274,7 +278,49 @@ export async function getCampaignRecipients(
   `;
 
   const recipients = await query<CampaignRecipient>(sql, queryParams);
-  return { recipients, total };
+  return {
+    recipients: stepsTotal > 0 ? recipients.map((r) => ({ ...r, steps_total: stepsTotal })) : recipients,
+    total,
+  };
+}
+
+export interface DripProgressRow {
+  current_step: number;
+  status: CampaignRecipient["status"];
+  count: number;
+}
+
+export interface DripStepProgress {
+  stepIndex: number;
+  sent: number;
+  waiting: number;
+  failed: number;
+}
+
+/**
+ * Per-step outcome for a drip. `current_step` is the 0-based index of the step a recipient is
+ * waiting for (or failed on), so a recipient at 1 has already received step 0; a completed
+ * recipient stays at its last index but has received every step.
+ */
+export function buildDripProgress(
+  stepCount: number,
+  rows: DripProgressRow[]
+): { progress: DripStepProgress[]; messagesSent: number } {
+  const progress: DripStepProgress[] = Array.from({ length: stepCount }, (_, stepIndex) => ({
+    stepIndex,
+    sent: 0,
+    waiting: 0,
+    failed: 0,
+  }));
+
+  for (const { current_step, status, count } of rows) {
+    const reached = status === "completed" ? stepCount : Math.min(current_step, stepCount);
+    for (let i = 0; i < reached; i++) progress[i].sent += count;
+    if (reached < stepCount && status === "pending") progress[reached].waiting += count;
+    if (reached < stepCount && status === "failed") progress[reached].failed += count;
+  }
+
+  return { progress, messagesSent: progress.reduce((sum, step) => sum + step.sent, 0) };
 }
 
 export async function getCampaignAnalytics(tenantId: string, campaignId: string): Promise<any | null> {
@@ -327,8 +373,24 @@ export async function getCampaignAnalytics(tenantId: string, campaignId: string)
   const failureRate = total > 0 ? Math.round((failed / total) * 100) : 0;
   const pendingRate = total > 0 ? Math.round((pending / total) * 100) : 0;
 
+  const drip =
+    campaign.type === "drip"
+      ? buildDripProgress(
+          (campaign.definition as Partial<DripDefinition>).steps?.length ?? 0,
+          await query<DripProgressRow>(
+            `SELECT current_step, status, COUNT(id)::int AS count
+             FROM campaign_recipients
+             WHERE campaign_id = $1
+             GROUP BY current_step, status`,
+            [campaignId]
+          )
+        )
+      : null;
+
   return {
     campaign,
+    ...(drip ? { dripProgress: drip.progress, messagesSent: drip.messagesSent } : {}),
+    ...(campaign.type === "drip" ? { scheduler: getDripSchedulerStatus() } : {}),
     metrics: {
       totalRecipients: total,
       sentCount: sent,

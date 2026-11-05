@@ -19,6 +19,11 @@ import { dealsRouter } from "./modules/deals/deals.routes";
 import { campaignsRouter } from "./modules/campaigns/campaigns.routes";
 import { linksRouter } from "./modules/links/links.routes";
 import { processDueDripSteps } from "./modules/campaigns/campaign-sender";
+import {
+  initDripSchedulerStatus,
+  recordDripRunSuccess,
+  recordDripRunError,
+} from "./modules/campaigns/drip-scheduler-status";
 import { whatsappOnboardingRouter } from "./modules/whatsapp-onboarding/embedded-signup.routes";
 import { templatesRouter } from "./modules/whatsapp-onboarding/templates.routes";
 import { searchRouter } from "./modules/search/search.routes";
@@ -215,14 +220,25 @@ ensureSearchIndices().catch((err) =>
  * drip delays but worth knowing.
  */
 const DRIP_POLL_INTERVAL_MS = Number(process.env.DRIP_POLL_INTERVAL_MS) || 30_000;
+const dripLog = logger.child({ module: "drip-scheduler" });
+let dripPassRunning = false;
+dripLog.info(`drip scheduler polling every ${DRIP_POLL_INTERVAL_MS}ms`);
+initDripSchedulerStatus(DRIP_POLL_INTERVAL_MS);
 setInterval(async () => {
+  // A slow pass must not overlap the next one: both would pick up the same pending recipients.
+  if (dripPassRunning) return;
+  dripPassRunning = true;
   try {
     const result = await processDueDripSteps();
+    recordDripRunSuccess(result);
     if (result.processed || result.failed) {
-      console.log(`[drip-scheduler] processed=${result.processed} failed=${result.failed}`);
+      dripLog.info(`processed=${result.processed} failed=${result.failed}`);
     }
   } catch (err) {
-    console.error("[drip-scheduler] error running due steps", err);
+    recordDripRunError(err);
+    dripLog.error("error running due drip steps", err);
+  } finally {
+    dripPassRunning = false;
   }
 }, DRIP_POLL_INTERVAL_MS);
 
