@@ -17,7 +17,10 @@ import {
   resumeBotForConversation,
 } from "./conversations.service";
 import { listMessages, sendOutboundMessage } from "../messages/messages.service";
-import { uploadMedia } from "../../db/object-storage";
+import { v4 as uuidv4 } from "uuid";
+import { deleteMedia, uploadMedia } from "../../db/object-storage";
+import { logger } from "../../utils/logger";
+import { classifyUpload } from "../../utils/media-types";
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -144,46 +147,41 @@ conversationsRouter.post(
  */
 conversationsRouter.post(
   "/:id/media",
+  canWorkConversations,
   upload.single("file"),
   asyncHandler(async (req: AuthedRequest, res) => {
+    const conversationId = conversationIdOf(req);
+    const tenantId = req.auth!.tenantId;
+
     const file = req.file;
     if (!file) {
       return res.status(400).json({ error: "No file provided" });
     }
 
-    const caption = typeof req.body.caption === "string" ? req.body.caption.trim() : typeof req.body.text === "string" ? req.body.text.trim() : undefined;
-    const explicitType = req.body.type as string | undefined;
-
-    // Detect media type from MIME type
-    let messageType: "image" | "document" | "audio" | "video" | "sticker" = "document";
-    const mime = file.mimetype.toLowerCase();
-    if (explicitType && ["image", "document", "audio", "video", "sticker"].includes(explicitType)) {
-      messageType = explicitType as any;
-    } else if (mime.startsWith("image/webp")) {
-      messageType = "sticker";
-    } else if (mime.startsWith("image/")) {
-      messageType = "image";
-    } else if (mime.startsWith("video/")) {
-      messageType = "video";
-    } else if (mime.startsWith("audio/")) {
-      messageType = "audio";
+    // Check the conversation before storing anything, so a bad id never leaves an orphan file.
+    if (!(await getConversation(tenantId, conversationId))) {
+      return res.status(404).json({ error: "Conversation not found" });
     }
 
-    // Sanitize filename and construct unique S3 storage key
-    const sanitizedFilename = file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
-    const storageKey = `${req.auth!.tenantId}/${req.params.id}/${Date.now()}-${sanitizedFilename}`;
+    const caption = typeof req.body.caption === "string" ? req.body.caption.trim() : typeof req.body.text === "string" ? req.body.text.trim() : undefined;
+    const requestedKind = typeof req.body.type === "string" ? req.body.type : undefined;
 
-    // Upload buffer to object storage
-    await uploadMedia({
-      key: storageKey,
-      body: file.buffer,
-      contentType: file.mimetype,
-    });
+    const { kind: messageType, contentType } = classifyUpload(file, { requestedKind });
+
+    const sanitizedFilename = file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const storageKey = `${tenantId}/${conversationId}/${uuidv4()}_${sanitizedFilename}`;
+
+    try {
+      await uploadMedia({ key: storageKey, body: file.buffer, contentType });
+    } catch (err) {
+      logger.error("[conversations] Could not store uploaded media", err, { tenantId, conversationId });
+      throw httpError(502, "Could not store the file. Please try again.");
+    }
 
     try {
       const message = await sendOutboundMessage({
-        tenantId: req.auth!.tenantId,
-        conversationId: req.params.id,
+        tenantId,
+        conversationId,
         senderUserId: req.auth!.userId,
         text: caption,
         type: messageType,
@@ -193,7 +191,11 @@ conversationsRouter.post(
 
       res.status(201).json(message);
     } catch (err: any) {
-      console.error("[conversations] Outbound media send error:", err);
+      logger.warn("[conversations] Outbound media send failed", { tenantId, conversationId, reason: err?.message });
+      // The message was never recorded, so the stored file would be unreachable garbage.
+      await deleteMedia(storageKey).catch((cleanupErr) => {
+        logger.warn("[conversations] Could not remove orphaned media", { storageKey, reason: cleanupErr?.message });
+      });
       const statusCode = typeof err?.status === "number" && err.status >= 400 && err.status < 600
         ? err.status
         : 400;

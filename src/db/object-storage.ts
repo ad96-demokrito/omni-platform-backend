@@ -1,4 +1,11 @@
-import { S3Client, PutObjectCommand, GetObjectCommand, HeadBucketCommand, CreateBucketCommand } from "@aws-sdk/client-s3";
+import {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+  DeleteObjectCommand,
+  HeadBucketCommand,
+  CreateBucketCommand,
+} from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 const BUCKET = process.env.MEDIA_BUCKET || "omni-platform-media";
@@ -92,13 +99,30 @@ export async function resolveHeaderMediaUrl(
   }
 }
 
-/** Fetch media object body and headers directly for streaming through API */
-export async function getMediaObject(key: string): Promise<{ body: any; contentType: string; contentLength?: number }> {
+export interface MediaObject {
+  // The AWS SDK types Body as a union of Node/web streams; the route narrows it before piping.
+  body: unknown;
+  contentType: string;
+  /** Bytes in `body` (the requested slice when `range` was passed). */
+  contentLength?: number;
+  /** `Content-Range` value, present only when `range` was passed and honoured. */
+  contentRange?: string;
+}
+
+/** Fetch media object body and headers directly for streaming through API. `range` is an HTTP Range header value. */
+export async function getMediaObject(key: string, range?: string): Promise<MediaObject> {
   const s3 = getS3Client();
-  const res = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
+  const res = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key, Range: range }));
   return {
     body: res.Body,
     contentType: res.ContentType || "application/octet-stream",
     contentLength: res.ContentLength,
+    contentRange: res.ContentRange,
   };
+}
+
+/** Removes an uploaded object, e.g. when the message it was uploaded for could not be sent. */
+export async function deleteMedia(key: string): Promise<void> {
+  const s3 = getS3Client();
+  await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }));
 }

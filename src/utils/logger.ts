@@ -49,6 +49,11 @@ const SENSITIVE_KEYS = [
   "bearer",
 ];
 
+/** Masks login tokens and media signatures in a request URL before it is logged. */
+export function redactUrl(url: string): string {
+  return url.replace(/([?&](?:token|sig)=)[^&#]*/gi, "$1[redacted]");
+}
+
 /**
  * Sanitizes metadata objects by masking sensitive tokens, secrets, and passwords.
  */

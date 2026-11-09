@@ -1884,6 +1884,86 @@
       "description": "Requires object storage reachable (MinIO via docker-compose, or real S3) AND an object that actually exists at the given key — this collection has no way to create real WhatsApp/Telegram media via a mock, so this request is illustrative and will likely 404 unless you've received a real media message first.",
       "item": [
         {
+          "name": "Send Media In Conversation (multipart)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": []
+                },
+                {
+                  "key": "caption",
+                  "value": "Optional caption",
+                  "type": "text"
+                },
+                {
+                  "key": "type",
+                  "value": "",
+                  "description": "Optional: 'document' sends an image as a document, 'sticker' sends a WebP as a sticker. Otherwise detected from the file.",
+                  "type": "text",
+                  "disabled": true
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/conversations/{{conversationId}}/media",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "conversations",
+                "{{conversationId}}",
+                "media"
+              ]
+            },
+            "description": "Roles owner/admin/agent. Allowed: JPG/PNG/WebP images (max 5 MB), MP4/3GP/MOV/WebM video (max 16 MB), AAC/M4A/MP3/AMR/OGG audio (max 16 MB), PDF/Office/TXT/CSV documents (max 50 MB). 400 UNSUPPORTED_MEDIA_TYPE for other types, 413 FILE_TOO_LARGE over a limit, 404 for another tenant's conversation. The response message carries a signed `mediaUrl` (fresh on every read) and `mediaStorageKey`."
+          },
+          "response": []
+        },
+        {
+          "name": "Get Media File (signed link or token)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "description": "Not needed when the URL carries exp+sig (the signed `mediaUrl` from a message). A tenant or webchat-visitor token is otherwise required; ?token= works for <img>/<video> src."
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/media/file?key={{tenantId}}/{{conversationId}}/example.jpg",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "media",
+                "file"
+              ],
+              "query": [
+                {
+                  "key": "key",
+                  "value": "{{tenantId}}/{{conversationId}}/example.jpg"
+                }
+              ]
+            },
+            "description": "401 without a signature or token, 403 for an invalid/expired signature, 404 for another tenant's (or another visitor conversation's) file. Supports Range requests (206). Only images, video and audio are served inline; every other type is sent as an attachment."
+          },
+          "response": []
+        },
+        {
           "name": "Get Media Download URL",
           "request": {
             "method": "GET",

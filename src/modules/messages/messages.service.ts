@@ -10,7 +10,14 @@ import {
 } from "../conversations/conversations.service";
 import { getChannelWithCredentials } from "../channels/channels.service";
 import { getAdapter } from "../channels/channel-registry";
-import { getMediaDownloadUrl, resolveHeaderMediaUrl } from "../../db/object-storage";
+import { resolveHeaderMediaUrl } from "../../db/object-storage";
+import {
+  isSafeMediaKey,
+  keyFromMediaUrl,
+  providerMediaUrl,
+  signedMediaUrl,
+  tenantOwnsKey,
+} from "../media/media.service";
 import { indexMessage } from "../search/search.service";
 import { emitRealtimeEvent } from "../realtime/websocket.service";
 import { dispatchWebhookEvent } from "../webhooks/outgoing-webhooks.service";
@@ -81,20 +88,26 @@ interface MessageStatusEventDoc {
 }
 
 function toMessage(doc: MessageDoc): Message {
+  // Older webchat uploads were saved with type "file"; every consumer understands "document".
+  const type = doc.type === "file" ? "document" : doc.type;
   const rawText = doc.content?.text || (typeof doc.content === "string" ? doc.content : "");
   const text =
     rawText ||
-    (doc.type === "template" ? `[Template: ${doc.content?.templateName || ""}]` : "") ||
-    (doc.type === "image" ? "[Image]" : "") ||
-    (doc.type === "document" ? (doc.content?.filename ? `[Document: ${doc.content.filename}]` : "[Document]") : "") ||
-    (doc.type === "audio" ? "[Audio]" : "") ||
-    (doc.type === "video" ? "[Video]" : "") ||
-    (doc.type === "sticker" ? "[Sticker]" : "") ||
+    (type === "template" ? `[Template: ${doc.content?.templateName || ""}]` : "") ||
+    (type === "image" ? "[Image]" : "") ||
+    (type === "document" ? (doc.content?.filename ? `[Document: ${doc.content.filename}]` : "[Document]") : "") ||
+    (type === "audio" ? "[Audio]" : "") ||
+    (type === "video" ? "[Video]" : "") ||
+    (type === "sticker" ? "[Sticker]" : "") ||
     "";
 
   const isoDate = doc.sentAt ? new Date(doc.sentAt).toISOString() : new Date().toISOString();
-  const mediaStorageKey = doc.content?.mediaStorageKey;
-  const mediaUrl = doc.content?.headerValue || doc.content?.mediaUrl || doc.content?.mediaProviderId;
+  const storedUrl = doc.content?.headerValue || doc.content?.mediaUrl || doc.content?.mediaProviderId;
+  // Old rows only kept a /api/media/file?key= URL, so recover the key from it.
+  const mediaStorageKey: string | undefined = doc.content?.mediaStorageKey || keyFromMediaUrl(storedUrl);
+  // The stored URL may have expired (presigned) or be relative to the wrong origin, so a file we hold
+  // is always re-linked with a fresh signed URL.
+  const mediaUrl = mediaStorageKey ? signedMediaUrl(mediaStorageKey) : storedUrl;
 
   return {
     _id: doc.id,
@@ -104,7 +117,7 @@ function toMessage(doc: MessageDoc): Message {
     conversation_id: doc.conversationId,
     conversationId: doc.conversationId,
     direction: doc.direction,
-    type: doc.type,
+    type,
     text,
     mediaUrl,
     mediaStorageKey,
@@ -238,6 +251,11 @@ export async function sendOutboundMessage(params: {
   } = params;
   let { mediaUrl, mediaStorageKey } = params;
 
+  // The key comes from the client; it must point at one of this tenant's own files.
+  if (mediaStorageKey && !(isSafeMediaKey(mediaStorageKey) && tenantOwnsKey(tenantId, mediaStorageKey))) {
+    throw Object.assign(new Error("Invalid media reference"), { status: 400 });
+  }
+
   const conversation = await queryOne<{ channel_id: string; contact_external_id: string }>(
     `SELECT c.channel_id, ct.external_id AS contact_external_id
      FROM conversations c
@@ -275,7 +293,7 @@ export async function sendOutboundMessage(params: {
   } else if (["image", "document", "audio", "video", "sticker"].includes(type)) {
     // Media message sending
     if (!mediaUrl && mediaStorageKey) {
-      mediaUrl = await getMediaDownloadUrl(mediaStorageKey);
+      mediaUrl = await providerMediaUrl(mediaStorageKey);
     }
     if (!mediaUrl) throw new Error(`mediaUrl or mediaStorageKey is required for ${type} messages`);
 
@@ -315,7 +333,8 @@ export async function sendOutboundMessage(params: {
   } else if (type === "text") {
     content = { text };
   } else {
-    content = { text, mediaUrl, mediaStorageKey, filename };
+    // With a storage key the URL is generated on read (toMessage); a stored one would only go stale.
+    content = mediaStorageKey ? { text, mediaStorageKey, filename } : { text, mediaUrl, filename };
   }
 
   const doc: MessageDoc = {

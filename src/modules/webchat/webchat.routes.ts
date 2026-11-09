@@ -5,6 +5,9 @@ import { v4 as uuidv4 } from "uuid";
 import { AuthedRequest, requireAuth } from "../../middleware/auth";
 import { asyncHandler } from "../../middleware/async-handler";
 import { uploadMedia } from "../../db/object-storage";
+import { rateLimitByIp } from "../../middleware/rate-limit";
+import { classifyUpload, MEDIA_MAX_BYTES } from "../../utils/media-types";
+import { isSafeMediaKey, signedMediaUrl } from "../media/media.service";
 import { listMessages } from "../messages/messages.service";
 import { emitRealtimeEvent } from "../realtime/websocket.service";
 import {
@@ -23,8 +26,12 @@ const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB max per media upload
+  limits: { fileSize: MEDIA_MAX_BYTES.document }, // per-type limits are enforced by classifyUpload
 });
+
+const MAX_VISITOR_TEXT_LENGTH = 4000;
+const MAX_FILENAME_LENGTH = 255;
+const VISITOR_MEDIA_TYPES = ["image", "video", "audio", "document"];
 
 export interface VisitorRequest extends Request {
   visitor?: VisitorAuthPayload;
@@ -155,10 +162,30 @@ webchatRouter.get(
  */
 webchatRouter.post(
   "/messages",
+  rateLimitByIp("webchat-messages", 120, 60),
   requireVisitorAuth,
   asyncHandler(async (req: VisitorRequest, res: Response) => {
     const visitor = req.visitor!;
-    const { text, mediaUrl, mediaStorageKey, type } = req.body;
+    const body = (req.body || {}) as Record<string, unknown>;
+
+    if (body.text !== undefined && (typeof body.text !== "string" || body.text.length > MAX_VISITOR_TEXT_LENGTH)) {
+      return res.status(400).json({ error: `Message text must be at most ${MAX_VISITOR_TEXT_LENGTH} characters` });
+    }
+
+    // Visitors may only attach a file they uploaded to this conversation. Any client-supplied URL is
+    // ignored: the stored key is the only reference, and agents/the widget get a fresh signed link from it.
+    let mediaStorageKey: string | undefined;
+    let type: string | undefined;
+    let filename: string | undefined;
+    if (body.mediaStorageKey !== undefined) {
+      const key = body.mediaStorageKey;
+      if (!isSafeMediaKey(key) || !key.startsWith(`webchat/${visitor.tenantId}/${visitor.conversationId}/`)) {
+        return res.status(400).json({ error: "Invalid attachment reference" });
+      }
+      mediaStorageKey = key;
+      type = typeof body.type === "string" && VISITOR_MEDIA_TYPES.includes(body.type) ? body.type : "document";
+      filename = typeof body.filename === "string" ? body.filename.slice(0, MAX_FILENAME_LENGTH) : undefined;
+    }
 
     const message = await sendVisitorMessage({
       tenantId: visitor.tenantId,
@@ -166,9 +193,9 @@ webchatRouter.post(
       conversationId: visitor.conversationId,
       contactId: visitor.contactId,
       visitorSessionId: visitor.visitorSessionId,
-      text,
-      mediaUrl,
+      text: typeof body.text === "string" ? body.text : undefined,
       mediaStorageKey,
+      filename,
       type,
     });
 
@@ -209,6 +236,7 @@ webchatRouter.post(
  */
 webchatRouter.post(
   "/upload",
+  rateLimitByIp("webchat-upload", 30, 10 * 60),
   requireVisitorAuth,
   upload.single("file"),
   asyncHandler(async (req: VisitorRequest, res: Response) => {
@@ -217,22 +245,19 @@ webchatRouter.post(
       return res.status(400).json({ error: "No file uploaded" });
     }
 
+    const { kind, contentType } = classifyUpload(req.file);
+
     const safeFilename = req.file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
     const key = `webchat/${visitor.tenantId}/${visitor.conversationId}/${uuidv4()}_${safeFilename}`;
 
-    await uploadMedia({
-      key,
-      body: req.file.buffer,
-      contentType: req.file.mimetype || "application/octet-stream",
-    });
-
-    const fileUrl = `/api/media/file?key=${encodeURIComponent(key)}`;
+    await uploadMedia({ key, body: req.file.buffer, contentType });
 
     res.json({
       key,
-      url: fileUrl,
+      url: signedMediaUrl(key),
+      type: kind,
       filename: req.file.originalname,
-      contentType: req.file.mimetype,
+      contentType,
       size: req.file.size,
     });
   })
@@ -603,9 +628,26 @@ webchatRouter.get("/embed.js", (req: Request, res: Response) => {
       display: block;
       cursor: pointer;
     }
+    .omni-bubble video {
+      max-width: 100%;
+      border-radius: 8px;
+      margin-top: 4px;
+      display: block;
+    }
+    .omni-bubble audio {
+      width: 100%;
+      min-width: 200px;
+      margin-top: 4px;
+      display: block;
+    }
     .omni-bubble a {
       color: inherit;
       text-decoration: underline;
+    }
+    .omni-pending .omni-bubble.omni-error {
+      background: #fef2f2;
+      color: #b91c1c;
+      border: 1px solid #fecaca;
     }
     .omni-time {
       font-size: 10px;
@@ -832,7 +874,7 @@ webchatRouter.get("/embed.js", (req: Request, res: Response) => {
       <div class="omni-footer">
         <div class="omni-input-row">
           <textarea class="omni-textarea" id="chatInput" placeholder="Type your message..." rows="1"></textarea>
-          <input type="file" id="fileInput" style="display: none;" accept="image/*,.pdf,.doc,.docx,audio/*" />
+          <input type="file" id="fileInput" style="display: none;" accept="image/jpeg,image/png,image/webp,video/mp4,video/quicktime,audio/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv" />
           <button class="omni-action-btn" id="attachBtn" title="Attach File" aria-label="Attach File">
             <svg viewBox="0 0 24 24"><path d="M16.5 6v11.5c0 2.21-1.79 4-4 4s-4-1.79-4-4V5c0-1.38 1.12-2.5 2.5-2.5s2.5 1.12 2.5 2.5v10.5c0 .55-.45 1-1 1s-1-.45-1-1V6H10v9.5c0 1.38 1.12 2.5 2.5 2.5s2.5-1.12 2.5-2.5V5c0-2.21-1.79-4-4-4S7 2.79 7 5v12.5c0 3.04 2.46 5.5 5.5 5.5s5.5-2.46 5.5-5.5V6h-1.5z"/></svg>
           </button>
@@ -914,6 +956,8 @@ webchatRouter.get("/embed.js", (req: Request, res: Response) => {
     if (fileInput.files && fileInput.files[0]) {
       uploadAttachment(fileInput.files[0]);
     }
+    // Clear the selection so choosing the same file again still fires 'change'.
+    fileInput.value = '';
   });
 
   // API Call Wrapper
@@ -928,7 +972,13 @@ webchatRouter.get("/embed.js", (req: Request, res: Response) => {
     var url = baseHost + endpoint + sep + 'parentOrigin=' + encodeURIComponent(parentOrigin);
     return fetch(url, opts).then(function(res) {
       if (!res.ok) {
-        return res.json().then(function(err) { throw err; }).catch(function() { throw new Error('HTTP ' + res.status); });
+        // Keep the server's message (err.error) so callers can show it; fall back to the status code.
+        return res.json().catch(function() { return null; }).then(function(body) {
+          var failure = new Error((body && body.error) || ('HTTP ' + res.status));
+          failure.status = res.status;
+          failure.error = body && body.error;
+          throw failure;
+        });
       }
       return res.json();
     });
@@ -1045,9 +1095,68 @@ webchatRouter.get("/embed.js", (req: Request, res: Response) => {
   }
 
   // Render Messages
+  // Media URLs come back relative to the API when PUBLIC_API_URL is not set; on a customer's site
+  // they must point at our host. Anything that is not http(s) is dropped.
+  function resolveMediaUrl(url) {
+    if (typeof url !== 'string' || !url) return '';
+    var absolute = /^https?:\\/\\//i.test(url) ? url : baseHost + (url.charAt(0) === '/' ? '' : '/') + url;
+    return /^https?:\\/\\//i.test(absolute) ? absolute : '';
+  }
+
+  function appendMedia(bubble, msg) {
+    var url = resolveMediaUrl(msg.mediaUrl || msg.media_url);
+    if (!url) return false;
+    var type = msg.type === 'file' ? 'document' : msg.type;
+    var filename = (msg.content && msg.content.filename) || 'Attachment';
+
+    if (type === 'image' || type === 'sticker') {
+      var link = document.createElement('a');
+      link.href = url;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      var img = document.createElement('img');
+      img.src = url;
+      img.alt = filename;
+      img.loading = 'lazy';
+      link.appendChild(img);
+      bubble.appendChild(link);
+    } else if (type === 'video') {
+      var video = document.createElement('video');
+      video.src = url;
+      video.controls = true;
+      video.preload = 'metadata';
+      bubble.appendChild(video);
+    } else if (type === 'audio') {
+      var audio = document.createElement('audio');
+      audio.src = url;
+      audio.controls = true;
+      audio.preload = 'none';
+      bubble.appendChild(audio);
+    } else {
+      var doc = document.createElement('a');
+      doc.href = url;
+      doc.target = '_blank';
+      doc.rel = 'noopener noreferrer';
+      doc.textContent = '📄 ' + filename;
+      bubble.appendChild(doc);
+    }
+    return true;
+  }
+
+  // The server fills "[Image]" / "[Document: x]" as text when a file has no caption; it is not for display.
+  var MEDIA_PLACEHOLDER_TEXT = /^\\[(Image|Video|Audio|Sticker|Document)(: [^\\]]*)?\\]$/;
+
   function renderMessages(msgs) {
     if (!Array.isArray(msgs)) return;
     state.messages = msgs;
+
+    // The 3.5s poll returns the same list most of the time; rebuilding it would flicker images and
+    // reset scrolling, so only redraw when something changed.
+    var signature = msgs.map(function(m) {
+      return [m.id, m.status, m.mediaUrl || m.media_url || '', m.text || ''].join('|');
+    }).join('\\n');
+    if (signature === state.renderSignature && !messagesList.querySelector('.omni-optimistic')) return;
+    state.renderSignature = signature;
 
     // Clear existing dynamic messages (keep greeting)
     var items = messagesList.querySelectorAll('.omni-dynamic-msg');
@@ -1061,16 +1170,9 @@ webchatRouter.get("/embed.js", (req: Request, res: Response) => {
       var bubble = document.createElement('div');
       bubble.className = 'omni-bubble';
 
-      if (msg.mediaUrl || msg.media_url) {
-        var mUrl = msg.mediaUrl || msg.media_url;
-        if (mUrl.match(/\\.(jpg|jpeg|png|gif|webp)(\\?.*)?$/i) || msg.type === 'image') {
-          bubble.innerHTML = '<a href="' + mUrl + '" target="_blank"><img src="' + mUrl + '" alt="attachment" /></a>';
-        } else {
-          bubble.innerHTML = '<a href="' + mUrl + '" target="_blank">📄 View Attachment</a>';
-        }
-      }
+      var hasMedia = appendMedia(bubble, msg);
 
-      if (msg.text) {
+      if (msg.text && !(hasMedia && MEDIA_PLACEHOLDER_TEXT.test(msg.text))) {
         var textNode = document.createElement('div');
         textNode.textContent = msg.text;
         bubble.appendChild(textNode);
@@ -1086,6 +1188,10 @@ webchatRouter.get("/embed.js", (req: Request, res: Response) => {
       messagesList.appendChild(group);
     });
 
+    // Upload progress/error notes are not part of the message list; keep them below the messages.
+    var pending = messagesList.querySelectorAll('.omni-pending');
+    for (var p = 0; p < pending.length; p++) messagesList.appendChild(pending[p]);
+
     scrollToBottom();
   }
 
@@ -1099,7 +1205,7 @@ webchatRouter.get("/embed.js", (req: Request, res: Response) => {
 
     // Optimistic UI Append
     var tempGroup = document.createElement('div');
-    tempGroup.className = 'omni-msg-group omni-dynamic-msg inbound';
+    tempGroup.className = 'omni-msg-group omni-dynamic-msg omni-optimistic inbound';
     tempGroup.innerHTML = '<div class="omni-bubble">' + escapeHtml(text) + '</div><div class="omni-time">Just now</div>';
     messagesList.appendChild(tempGroup);
     scrollToBottom();
@@ -1116,42 +1222,98 @@ webchatRouter.get("/embed.js", (req: Request, res: Response) => {
   }
 
   // Upload Attachment
+  // Mirrors the server's allow-list and size limits (backend utils/media-types.ts) so an unsuitable
+  // file is rejected before it is uploaded. The server stays the authority.
+  var UPLOAD_LIMITS_MB = { image: 5, video: 16, audio: 16, document: 50 };
+  var EXTENSION_KIND = {
+    jpg: 'image', jpeg: 'image', png: 'image', webp: 'image',
+    mp4: 'video', '3gp': 'video', mov: 'video', webm: 'video',
+    aac: 'audio', m4a: 'audio', mp3: 'audio', amr: 'audio', ogg: 'audio',
+    pdf: 'document', doc: 'document', docx: 'document', xls: 'document', xlsx: 'document',
+    ppt: 'document', pptx: 'document', txt: 'document', csv: 'document'
+  };
+
+  function uploadKindOf(file) {
+    var mime = (file.type || '').split(';')[0].toLowerCase();
+    var ext = (file.name.split('.').pop() || '').toLowerCase();
+    if (/^image\\/(jpeg|png|webp)$/.test(mime)) return 'image';
+    if (/^video\\/(mp4|3gpp|quicktime|webm)$/.test(mime)) return 'video';
+    if (/^audio\\/(aac|mp4|mpeg|amr|ogg|webm)$/.test(mime)) return 'audio';
+    if (/^application\\/(pdf|msword|vnd\\.)/.test(mime) || /^text\\/(plain|csv)$/.test(mime)) return 'document';
+    return EXTENSION_KIND[ext] || null;
+  }
+
+  // Progress and error notes for uploads. They live outside the polled message list (class
+  // omni-pending), so the 3.5s refresh does not wipe them mid-upload.
+  function showUploadNote(text, isError) {
+    var node = document.createElement('div');
+    node.className = 'omni-msg-group omni-pending inbound';
+    var bubble = document.createElement('div');
+    bubble.className = 'omni-bubble' + (isError ? ' omni-error' : '');
+    if (!isError) bubble.style.opacity = '0.7';
+    bubble.textContent = text;
+    node.appendChild(bubble);
+    messagesList.appendChild(node);
+    scrollToBottom();
+    if (isError) setTimeout(function() { node.remove(); }, 8000);
+    return { node: node, bubble: bubble };
+  }
+
   function uploadAttachment(file) {
     if (!state.token) return;
+
+    var kind = uploadKindOf(file);
+    if (!kind) {
+      showUploadNote('This file type is not supported. Send an image, video, audio file or a document (PDF, Office, TXT, CSV).', true);
+      return;
+    }
+    var limitMb = UPLOAD_LIMITS_MB[kind];
+    if (file.size > limitMb * 1024 * 1024) {
+      showUploadNote('That ' + kind + ' is too large. The limit is ' + limitMb + ' MB.', true);
+      return;
+    }
+
+    var note = showUploadNote('Uploading ' + file.name + '… 0%', false);
+    function fail(message) {
+      note.node.remove();
+      showUploadNote(message, true);
+    }
+
     var formData = new FormData();
     formData.append('file', file);
 
-    var uploadToast = document.createElement('div');
-    uploadToast.className = 'omni-msg-group omni-dynamic-msg inbound';
-    uploadToast.innerHTML = '<div class="omni-bubble" style="opacity:0.7;">Uploading ' + escapeHtml(file.name) + '...</div>';
-    messagesList.appendChild(uploadToast);
-    scrollToBottom();
-
-    fetch(baseHost + '/api/webchat/upload?parentOrigin=' + encodeURIComponent(parentOrigin), {
-      method: 'POST',
-      headers: {
-        'Authorization': 'Bearer ' + state.token,
-        'x-parent-origin': parentOrigin
-      },
-      body: formData
-    }).then(function(res) { return res.json(); })
-      .then(function(data) {
-        uploadToast.remove();
-        if (data.url) {
-          apiFetch('/api/webchat/messages', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              text: '',
-              mediaUrl: data.url,
-              type: file.type.startsWith('image/') ? 'image' : 'file'
-            })
-          }).then(function() { fetchMessages(); });
-        }
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', baseHost + '/api/webchat/upload?parentOrigin=' + encodeURIComponent(parentOrigin));
+    xhr.setRequestHeader('Authorization', 'Bearer ' + state.token);
+    xhr.setRequestHeader('x-parent-origin', parentOrigin);
+    xhr.timeout = 120000;
+    xhr.upload.onprogress = function(e) {
+      if (e.lengthComputable) {
+        note.bubble.textContent = 'Uploading ' + file.name + '… ' + Math.round((e.loaded / e.total) * 100) + '%';
+      }
+    };
+    // A proxy rejecting an oversized body answers without CORS headers, which the browser reports as a network error.
+    xhr.onerror = function() { fail('Upload failed. Please check your connection, or the file may be too large.'); };
+    xhr.ontimeout = function() { fail('Upload timed out. Please try again.'); };
+    xhr.onload = function() {
+      var data = {};
+      try { data = JSON.parse(xhr.responseText); } catch (e) { data = {}; }
+      if (xhr.status < 200 || xhr.status >= 300 || !data.key) {
+        fail(data.error || (xhr.status === 413 ? 'That file is too large to upload.' : 'Upload failed (error ' + xhr.status + ').'));
+        return;
+      }
+      apiFetch('/api/webchat/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: '', mediaStorageKey: data.key, type: data.type, filename: data.filename })
+      }).then(function() {
+        note.node.remove();
+        fetchMessages();
       }).catch(function(err) {
-        uploadToast.remove();
-        alert('Failed to upload file');
+        fail((err && err.error) || 'Could not send the file. Please try again.');
       });
+    };
+    xhr.send(formData);
   }
 
   // Handle Typing indicator

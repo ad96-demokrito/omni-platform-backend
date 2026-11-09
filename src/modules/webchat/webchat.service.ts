@@ -654,17 +654,17 @@ export async function sendVisitorMessage(params: {
   contactId: string;
   visitorSessionId: string;
   text?: string;
-  mediaUrl?: string;
   mediaStorageKey?: string;
+  filename?: string;
   type?: string;
 }): Promise<Message> {
-  const { tenantId, channelId, conversationId, visitorSessionId, text, mediaUrl, mediaStorageKey } = params;
+  const { tenantId, channelId, conversationId, visitorSessionId, text, mediaStorageKey, filename } = params;
 
-  if (!text && !mediaUrl && !mediaStorageKey) {
+  if (!text && !mediaStorageKey) {
     throw Object.assign(new Error("Message text or media is required"), { statusCode: 400 });
   }
 
-  const messageType = params.type || (mediaUrl || mediaStorageKey ? "image" : "text");
+  const messageType = mediaStorageKey ? params.type || "document" : "text";
   const providerMessageId = `wc_in_${uuidv4()}`;
 
   const { message } = await recordInboundMessage({
@@ -673,8 +673,8 @@ export async function sendVisitorMessage(params: {
     type: messageType,
     content: {
       text,
-      mediaUrl,
       mediaStorageKey,
+      filename,
       visitorSessionId,
     },
     sentAt: new Date(),

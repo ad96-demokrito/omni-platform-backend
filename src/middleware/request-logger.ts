@@ -1,6 +1,6 @@
 import { Request, Response, NextFunction } from "express";
 import { v4 as uuidv4 } from "uuid";
-import { Logger, logger, sanitizeMeta } from "../utils/logger";
+import { Logger, logger, redactUrl, sanitizeMeta } from "../utils/logger";
 import { AuthedRequest } from "./auth";
 
 declare global {
@@ -43,7 +43,7 @@ export function requestLogger(req: Request, res: Response, next: NextFunction): 
     const durationMs = Date.now() - startTime;
     const statusCode = res.statusCode;
     const method = req.method;
-    const url = req.originalUrl || req.url;
+    const url = redactUrl(req.originalUrl || req.url);
 
     // Refresh context in case auth happened mid-flight
     const currentTenantId = (req as AuthedRequest).auth?.tenantId || tenantId;

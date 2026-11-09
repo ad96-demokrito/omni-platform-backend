@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from "express";
-import { logger, sanitizeMeta } from "../utils/logger";
+import { logger, redactUrl, sanitizeMeta } from "../utils/logger";
 import { AuthedRequest } from "./auth";
 
 /**
@@ -25,7 +25,7 @@ export function errorHandler(
   });
 
   const method = req.method;
-  const url = req.originalUrl || req.url;
+  const url = redactUrl(req.originalUrl || req.url);
 
   const errorContext = {
     method,
@@ -38,10 +38,24 @@ export function errorHandler(
     ip: req.ip || req.socket.remoteAddress,
   };
 
+  // Upload/body size failures carry no HTTP status of their own; map them so clients see a 4xx, not a 500.
+  const isUploadError = err?.name === "MulterError";
+  const isFileTooLarge = err?.code === "LIMIT_FILE_SIZE" || err?.type === "entity.too.large";
+  const clientErrorCode = isFileTooLarge ? "FILE_TOO_LARGE" : isUploadError ? "UPLOAD_ERROR" : undefined;
+
   // Client-specified status code
-  const statusCode = typeof err?.statusCode === "number" ? err.statusCode : typeof err?.status === "number" ? err.status : 500;
+  const statusCode = isFileTooLarge
+    ? 413
+    : isUploadError
+      ? 400
+      : typeof err?.statusCode === "number" ? err.statusCode : typeof err?.status === "number" ? err.status : 500;
+  const clientMessage = isFileTooLarge
+    ? "The file is too large to upload."
+    : isUploadError
+      ? "The file upload was invalid."
+      : err?.message || "Client request error";
   const errorMessage = statusCode < 500
-    ? err?.message || "Client request error"
+    ? clientMessage
     : (process.env.NODE_ENV === "development" ? (err?.message || "Internal server error") : "Internal server error");
 
   // Log full stack only for 500+ unhandled server errors; warn for 4xx client errors
@@ -92,7 +106,7 @@ export function errorHandler(
 
   res.status(statusCode).json({
     error: errorMessage,
-    code: err?.code || (statusCode === 401 ? "UNAUTHORIZED" : statusCode === 403 ? "FORBIDDEN" : statusCode === 404 ? "NOT_FOUND" : statusCode === 400 ? "BAD_REQUEST" : "INTERNAL_SERVER_ERROR"),
+    code: clientErrorCode || err?.code || (statusCode === 401 ? "UNAUTHORIZED" : statusCode === 403 ? "FORBIDDEN" : statusCode === 404 ? "NOT_FOUND" : statusCode === 400 ? "BAD_REQUEST" : "INTERNAL_SERVER_ERROR"),
     requestId: reqId,
     ...(process.env.NODE_ENV === "development" && err?.stack && statusCode >= 500 ? { stack: err.stack } : {}),
   });
