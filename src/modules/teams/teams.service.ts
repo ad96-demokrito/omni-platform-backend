@@ -41,6 +41,46 @@ function cleanDescription(value: unknown): string | null {
   return value.trim() || null;
 }
 
+export interface TeamSettings {
+  /** When on, a flow hand-off is assigned to the least busy agent instead of waiting in Pending. */
+  autoAssignEnabled: boolean;
+}
+
+export async function getTeamSettings(tenantId: string): Promise<TeamSettings> {
+  const row = await queryOne<{ auto_assign_enabled: boolean }>(
+    "SELECT auto_assign_enabled FROM tenants WHERE id = $1",
+    [tenantId]
+  );
+  return { autoAssignEnabled: row?.auto_assign_enabled === true };
+}
+
+export async function updateTeamSettings(
+  tenantId: string,
+  actor: Actor,
+  input: { autoAssignEnabled?: unknown }
+): Promise<TeamSettings> {
+  if (typeof input.autoAssignEnabled !== "boolean") {
+    throw httpError(400, "autoAssignEnabled must be true or false");
+  }
+  const updated = await queryOne<{ auto_assign_enabled: boolean }>(
+    "UPDATE tenants SET auto_assign_enabled = $1 WHERE id = $2 RETURNING auto_assign_enabled",
+    [input.autoAssignEnabled, tenantId]
+  );
+  if (!updated) throw httpError(404, "Workspace not found");
+
+  await AuditService.record({
+    tenantId,
+    userId: actor.userId,
+    userEmail: actor.email,
+    action: "tenant.auto_assign_changed",
+    resourceType: "tenant",
+    resourceId: tenantId,
+    details: { autoAssignEnabled: input.autoAssignEnabled },
+    ipAddress: actor.ipAddress,
+  });
+  return { autoAssignEnabled: updated.auto_assign_enabled };
+}
+
 export async function listTeams(tenantId: string): Promise<Team[]> {
   return query<Team>(
     `SELECT t.id, t.tenant_id, t.name, t.description, t.created_at,

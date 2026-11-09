@@ -57,7 +57,9 @@ import { realtimeGateway } from "./modules/realtime/websocket.service";
 import { getPendingMigrations, describeBuild } from "./db/migration-status";
 
 import { runFlowForConversation } from "./modules/flows/flow-engine-runner";
-import { initFlowDelayWorker } from "./modules/jobs/queue.service";
+import { initFlowDelayWorker, initHandoffTimeoutWorker } from "./modules/jobs/queue.service";
+import { resumeBotAfterHandoffTimeout } from "./modules/conversations/conversations.service";
+import { sendOutboundMessage } from "./modules/messages/messages.service";
 
 dotenv.config();
 
@@ -255,5 +257,20 @@ initFlowDelayWorker(async (jobData) => {
     });
   } catch (err) {
     console.error(`[flow-delay-worker] Error resuming flow for conversation ${jobData.conversationId}:`, err);
+  }
+});
+
+/**
+ * Hand-off timeout: when nobody took a handed-off case in time, give it back to the bot and, if the
+ * flow author wrote one, tell the customer. Errors are rethrown so BullMQ retries (bounded).
+ */
+initHandoffTimeoutWorker(async (jobData) => {
+  const resumed = await resumeBotAfterHandoffTimeout(jobData.tenantId, jobData.conversationId, jobData.handoffAt);
+  if (resumed && jobData.timeoutMessage) {
+    await sendOutboundMessage({
+      tenantId: jobData.tenantId,
+      conversationId: jobData.conversationId,
+      text: jobData.timeoutMessage,
+    });
   }
 });

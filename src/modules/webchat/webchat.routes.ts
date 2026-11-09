@@ -8,6 +8,8 @@ import { uploadMedia } from "../../db/object-storage";
 import { rateLimitByIp } from "../../middleware/rate-limit";
 import { classifyUpload, MEDIA_MAX_BYTES } from "../../utils/media-types";
 import { isSafeMediaKey, signedMediaUrl } from "../media/media.service";
+import { getVisitorHandoffState } from "../conversations/conversations.service";
+import { isAgentTyping } from "../conversations/agent-typing";
 import { listMessages } from "../messages/messages.service";
 import { emitRealtimeEvent } from "../realtime/websocket.service";
 import {
@@ -151,8 +153,13 @@ webchatRouter.get(
   requireVisitorAuth,
   asyncHandler(async (req: VisitorRequest, res: Response) => {
     const visitor = req.visitor!;
-    const messages = await listMessages(visitor.tenantId, visitor.conversationId);
-    res.json({ messages });
+    const [messages, handoff, agentTyping] = await Promise.all([
+      listMessages(visitor.tenantId, visitor.conversationId),
+      getVisitorHandoffState(visitor.tenantId, visitor.conversationId),
+      isAgentTyping(visitor.tenantId, visitor.conversationId),
+    ]);
+    // `handoff` is the visitor-safe view: who is answering (bot, waiting for an agent, or an agent's first name).
+    res.json({ messages, handoff, agentTyping });
   })
 );
 
@@ -643,6 +650,12 @@ webchatRouter.get("/embed.js", (req: Request, res: Response) => {
     .omni-bubble a {
       color: inherit;
       text-decoration: underline;
+    }
+    .omni-sender {
+      font-size: 10px;
+      font-weight: 600;
+      color: var(--omni-subtext);
+      padding: 0 4px 2px;
     }
     .omni-pending .omni-bubble.omni-error {
       background: #fef2f2;
@@ -1152,7 +1165,7 @@ webchatRouter.get("/embed.js", (req: Request, res: Response) => {
 
     // The 3.5s poll returns the same list most of the time; rebuilding it would flicker images and
     // reset scrolling, so only redraw when something changed.
-    var signature = msgs.map(function(m) {
+    var signature = (state.agentFirstName || '') + '#' + msgs.map(function(m) {
       return [m.id, m.status, m.mediaUrl || m.media_url || '', m.text || ''].join('|');
     }).join('\\n');
     if (signature === state.renderSignature && !messagesList.querySelector('.omni-optimistic')) return;
@@ -1182,6 +1195,14 @@ webchatRouter.get("/embed.js", (req: Request, res: Response) => {
       time.className = 'omni-time';
       var d = msg.createdAt || msg.created_at || msg.sent_at ? new Date(msg.createdAt || msg.created_at || msg.sent_at) : new Date();
       time.textContent = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+      // Name the person answering, so the visitor can tell an agent from the bot.
+      if (!isInbound && msg.senderType === 'agent' && state.agentFirstName) {
+        var sender = document.createElement('div');
+        sender.className = 'omni-sender';
+        sender.textContent = state.agentFirstName;
+        group.appendChild(sender);
+      }
 
       group.appendChild(bubble);
       group.appendChild(time);
@@ -1338,11 +1359,50 @@ webchatRouter.get("/embed.js", (req: Request, res: Response) => {
     }, 2500);
   }
 
+  // Header line that tells the visitor who is answering: the bot, "connecting to an agent", or the agent's name.
+  function applyHandoffState(handoff) {
+    var subtitle = shadow.getElementById('widgetSubtitle');
+    if (!subtitle) return;
+    var current = handoff && handoff.state ? handoff.state : 'bot';
+    var name = handoff && handoff.agentFirstName ? handoff.agentFirstName : '';
+    var key = current + ':' + name;
+    if (key === state.handoffKey) return;
+
+    var wasBot = state.handoffKey === undefined || state.handoffKey.indexOf('bot:') === 0;
+    if (current !== 'bot' && wasBot) state.defaultSubtitle = subtitle.textContent;
+    state.handoffKey = key;
+    state.agentFirstName = name;
+
+    if (current === 'waiting') {
+      subtitle.textContent = 'Connecting you to an agent…';
+    } else if (current === 'active') {
+      subtitle.textContent = name ? 'You are chatting with ' + name : 'You are chatting with our team';
+    } else if (state.defaultSubtitle !== undefined) {
+      subtitle.textContent = state.defaultSubtitle;
+    }
+  }
+
+  // "Agent is typing" bubble. It lives outside the polled message list (class omni-pending).
+  function setAgentTyping(isTyping) {
+    var existing = messagesList.querySelector('.omni-agent-typing');
+    if (isTyping && !existing) {
+      var node = document.createElement('div');
+      node.className = 'omni-msg-group outbound omni-pending omni-agent-typing';
+      node.innerHTML = '<div class="omni-typing-indicator"><div class="omni-typing-dot"></div><div class="omni-typing-dot"></div><div class="omni-typing-dot"></div></div>';
+      messagesList.appendChild(node);
+      scrollToBottom();
+    } else if (!isTyping && existing) {
+      existing.remove();
+    }
+  }
+
   // Polling Messages
   function fetchMessages() {
     if (!state.token) return;
     apiFetch('/api/webchat/messages')
       .then(function(data) {
+        applyHandoffState(data.handoff);
+        setAgentTyping(Boolean(data.agentTyping));
         if (data.messages) {
           var prevCount = state.messages.length;
           renderMessages(data.messages);

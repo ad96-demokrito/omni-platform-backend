@@ -10,10 +10,90 @@ import {
   endFlowRun,
   getFlow,
 } from "./flows.service";
-import { advanceFlow, resumeFlowOnDeliveryStatus } from "./flow-engine";
-import { scheduleDelayedFlowResume } from "../jobs/queue.service";
+import { advanceFlow, resumeFlowOnDeliveryStatus, HandoffRequest } from "./flow-engine";
+import { scheduleDelayedFlowResume, scheduleHandoffTimeout } from "../jobs/queue.service";
 import { recordCampaignAnswers } from "../campaigns/campaign-answers";
-import { markConversationNeedsHuman } from "../conversations/conversations.service";
+import { handOffConversation, markConversationNeedsHuman } from "../conversations/conversations.service";
+
+const MAX_HANDOFF_CONTEXT_KEYS = 30;
+const MAX_HANDOFF_CONTEXT_VALUE_LENGTH = 200;
+/** Defaults every conversation already has on its contact; not worth repeating on the hand-off card. */
+const CONTACT_DEFAULT_KEYS = ["name", "phone", "email", "contact"];
+
+/**
+ * The answers the flow collected, for the agent's hand-off card. Internal keys (`_…`), the contact's
+ * own details, and anything that is not a short scalar are left out.
+ */
+function collectHandoffContext(
+  variables: Record<string, unknown>,
+  contactKeys: Iterable<string>
+): Record<string, string | number | boolean> {
+  const skip = new Set<string>([...CONTACT_DEFAULT_KEYS, ...contactKeys]);
+  const context: Record<string, string | number | boolean> = {};
+  for (const [key, value] of Object.entries(variables)) {
+    if (Object.keys(context).length >= MAX_HANDOFF_CONTEXT_KEYS) break;
+    if (key.startsWith("_") || skip.has(key)) continue;
+    if (typeof value === "string" && value.trim()) {
+      context[key] = value.slice(0, MAX_HANDOFF_CONTEXT_VALUE_LENGTH);
+    } else if (typeof value === "number" || typeof value === "boolean") {
+      context[key] = value;
+    }
+  }
+  return context;
+}
+
+/** Bot -> human: pause the bot, route the case, alert agents, and arm the optional timeout. */
+async function applyHandoff(params: {
+  tenantId: string;
+  conversationId: string;
+  request?: HandoffRequest;
+  variables: Record<string, unknown>;
+  contactKeys: Iterable<string>;
+  flowName?: string;
+}): Promise<void> {
+  const { tenantId, conversationId, request } = params;
+  try {
+    const outcome = await handOffConversation({
+      tenantId,
+      conversationId,
+      teamId: request?.teamId,
+      agentUserId: request?.agentUserId,
+      assignMode: request?.assignMode ?? "default",
+      reason: request?.reason,
+      priority: request?.priority ?? "normal",
+      context: collectHandoffContext(params.variables, params.contactKeys),
+      flowName: params.flowName,
+    });
+
+    // A timer only makes sense for a case nobody owns; an assigned case is a person's to answer.
+    if (outcome.applied && outcome.handoffAt && request && request.timeoutMinutes > 0 && !outcome.assignedAgentUserId) {
+      await scheduleHandoffTimeout(
+        {
+          tenantId,
+          conversationId,
+          handoffAt: outcome.handoffAt.toISOString(),
+          timeoutMessage: request.timeoutMessage,
+        },
+        request.timeoutMinutes * 60
+      );
+    }
+  } catch (err) {
+    console.error(`[flow-engine] could not hand off conversation ${conversationId}:`, err);
+    // Fall back to the old behaviour so agents at least see the case as pending.
+    await markConversationNeedsHuman(tenantId, conversationId).catch((e) => {
+      console.error(`[flow-engine] could not mark conversation ${conversationId} as pending:`, e);
+    });
+  }
+}
+
+/** True while a human owns the conversation (`conversations.bot_paused`). Tenant-scoped. */
+async function isBotPaused(tenantId: string, conversationId: string): Promise<boolean> {
+  const row = await queryOne<{ bot_paused: boolean }>(
+    "SELECT bot_paused FROM conversations WHERE id = $1 AND tenant_id = $2",
+    [conversationId, tenantId]
+  );
+  return row?.bot_paused === true;
+}
 
 export type FlowRunSkipReason = "locked" | "handed_off" | "no_flow" | "flow_unpublished" | "nothing_sent";
 
@@ -41,6 +121,12 @@ export async function runFlowForConversation(params: {
   const { tenantId, conversationId, defaultFlowId, incomingText, resumeAtNodeId, campaign } = params;
 
   const result = await withLock<FlowRunOutcome>(`flow-lock:${conversationId}`, 10_000, async () => {
+    // A person owns this case (hand-off, assignment, claim or reply): the bot stays out of it.
+    if (await isBotPaused(tenantId, conversationId)) {
+      console.log(`[flow-engine] conversation ${conversationId} is owned by a human — skipping flow`);
+      return { status: "skipped", reason: "handed_off" };
+    }
+
     let flowRun = await getActiveFlowRun(conversationId);
 
     // A campaign's flow always wins over a leftover run of another flow on the same conversation.
@@ -114,6 +200,13 @@ export async function runFlowForConversation(params: {
       { tenantId, conversationId }
     );
 
+    // An agent may have taken the case while this pass was computing (AI/RAG nodes are slow):
+    // drop the bot's messages instead of talking over them.
+    if (advance.outboundMessages.length > 0 && (await isBotPaused(tenantId, conversationId))) {
+      await updateFlowRun(flowRun.id, { currentNodeId: flowRun.current_node_id, variables: flowRun.variables ?? {}, status: "handed_off" });
+      return { status: "skipped", reason: "handed_off" };
+    }
+
     // Send messages and record providerMessageId
     let lastProviderMessageId: string | undefined;
     // The first message of the pass is the one a campaign recipient is tracked by
@@ -176,9 +269,13 @@ export async function runFlowForConversation(params: {
     });
 
     if (advance.status === "handed_off") {
-      // Bot -> human: show the case as "pending" so agents see it needs a person.
-      await markConversationNeedsHuman(tenantId, conversationId).catch((err) => {
-        console.error(`[flow-engine] could not mark conversation ${conversationId} as pending:`, err);
+      await applyHandoff({
+        tenantId,
+        conversationId,
+        request: advance.handoff,
+        variables: updatedVariables,
+        contactKeys: Object.keys(contactAttributes),
+        flowName: flow.name,
       });
     }
 
@@ -290,6 +387,18 @@ export async function handleDeliveryStatusCallback(params: {
       variables: advance.variables,
       status: advance.status === "awaiting_delivery" || advance.status === "waiting" ? "running" : advance.status,
     });
+
+    // A "delivered"/"failed" branch can end in a hand-off node too; it needs the same treatment.
+    if (advance.status === "handed_off") {
+      await applyHandoff({
+        tenantId,
+        conversationId,
+        request: advance.handoff,
+        variables: advance.variables,
+        contactKeys: [],
+        flowName: flow.name,
+      });
+    }
   });
 
   if (result === "locked") {

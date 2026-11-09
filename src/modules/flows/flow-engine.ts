@@ -1,4 +1,12 @@
-import { FlowDefinition, FlowNode, WaitNode, AIAgentNode, IntentRouterNode } from "./flows.types";
+import {
+  FlowDefinition,
+  FlowNode,
+  WaitNode,
+  AIAgentNode,
+  IntentRouterNode,
+  HandoffAssignMode,
+  HandoffPriority,
+} from "./flows.types";
 import { RAGService } from "../ai/rag.service";
 import { CopilotService } from "../ai/copilot.service";
 
@@ -28,12 +36,26 @@ export interface FlowAnswer {
   answer: string;
 }
 
+/** What a hand-off node asked for, with its text already interpolated. Set when `status` is "handed_off". */
+export interface HandoffRequest {
+  nodeId: string;
+  teamId?: string;
+  agentUserId?: string;
+  assignMode: HandoffAssignMode;
+  reason?: string;
+  priority: HandoffPriority;
+  /** 0 = never resume the bot automatically. */
+  timeoutMinutes: number;
+  timeoutMessage?: string;
+}
+
 export interface AdvanceResult {
   nextNodeId: string | null;
   variables: Record<string, any>;
   status: "running" | "waiting" | "awaiting_delivery" | "completed" | "handed_off";
   /** Messages to send out, in order, as this pass through the graph executes. */
   outboundMessages: OutboundFlowMessage[];
+  handoff?: HandoffRequest;
   scheduledResume?: ScheduledResume;
   /** Questions answered during this pass, in order. Set by `advanceFlow`. */
   answers?: FlowAnswer[];
@@ -421,7 +443,29 @@ async function runFlowSteps(
       }
 
       case "handoff": {
-        return { nextNodeId: null, variables, status: "handed_off", outboundMessages };
+        // The customer is told what happens next; without this message they hear nothing until an agent writes.
+        const customerMessage = node.customerMessage ? interpolate(node.customerMessage, variables).trim() : "";
+        if (customerMessage) {
+          outboundMessages.push({ type: "text", text: customerMessage, nodeId: node.id });
+        }
+        return {
+          nextNodeId: null,
+          variables,
+          status: "handed_off",
+          outboundMessages,
+          handoff: {
+            nodeId: node.id,
+            teamId: node.teamId || undefined,
+            agentUserId: node.agentUserId || undefined,
+            assignMode: node.assignMode ?? "default",
+            reason: node.reason ? interpolate(node.reason, variables).trim() || undefined : undefined,
+            priority: node.priority ?? "normal",
+            timeoutMinutes: node.timeoutMinutes && node.timeoutMinutes > 0 ? node.timeoutMinutes : 0,
+            timeoutMessage: node.timeoutMessage
+              ? interpolate(node.timeoutMessage, variables).trim() || undefined
+              : undefined,
+          },
+        };
       }
 
       case "end": {

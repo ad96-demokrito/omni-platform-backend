@@ -6,6 +6,15 @@ import { logger } from "../../utils/logger";
 import { AuthTokenPayload } from "../auth/auth.service";
 
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
+
+/** The only events a webchat visitor's socket may receive (see broadcastLocally). */
+const VISITOR_EVENTS: ReadonlySet<string> = new Set([
+  "message:new",
+  "conversation:message",
+  "message:status",
+  "conversation:typing",
+  "conversation:agent",
+]);
 const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
 
 export interface RealtimeSocket extends WebSocket {
@@ -342,6 +351,10 @@ class WebSocketManager {
         // Strict Zero-Internal-Note & Tenant Separation: Visitors only receive messages/typing for their conversation
         if (payload.event.startsWith("support_ticket:") || payload.event.startsWith("platform:") || payload.event.startsWith("system:")) return;
         if (payload.data?.isInternalNote || payload.data?.message?.isInternalNote) return;
+        // Only chat content reaches a visitor. Events such as conversation:update carry the assignee's
+        // identity, team, tenant and contact fields; the visitor learns about hand-offs through the
+        // sanitized conversation:agent event instead.
+        if (!VISITOR_EVENTS.has(payload.event)) return;
 
         try {
           socket.send(rawMessage);

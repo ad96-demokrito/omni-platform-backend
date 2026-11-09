@@ -8,6 +8,8 @@ import {
   updateTeam,
   deleteTeam,
   setTeamMembers,
+  getTeamSettings,
+  updateTeamSettings,
 } from "./teams.service";
 
 export const teamsRouter = Router();
@@ -23,6 +25,25 @@ function teamIdOf(req: AuthedRequest): string {
   if (!isUuid(req.params.id)) throw httpError(400, "Invalid team id");
   return req.params.id;
 }
+
+/**
+ * Workspace routing settings. Declared before the `/:id` routes so "settings" is not read as a team id.
+ * Anyone signed in can read it (the flow builder shows the current mode); only owners/admins change it.
+ */
+teamsRouter.get(
+  "/settings",
+  asyncHandler(async (req: AuthedRequest, res: Response) => {
+    res.json(await getTeamSettings(req.auth!.tenantId));
+  })
+);
+
+teamsRouter.patch(
+  "/settings",
+  requireRole("owner", "admin"),
+  asyncHandler(async (req: AuthedRequest, res: Response) => {
+    res.json(await updateTeamSettings(req.auth!.tenantId, actorOf(req), req.body || {}));
+  })
+);
 
 /** Any signed-in user can list teams (the inbox needs them for its assign menus). */
 teamsRouter.get(

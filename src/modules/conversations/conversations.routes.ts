@@ -10,6 +10,8 @@ import {
   ConversationStatus,
   listConversations,
   getConversation,
+  getConversationSummary,
+  conversationExists,
   assignAgent,
   assignTeam,
   claimConversation,
@@ -21,6 +23,8 @@ import { v4 as uuidv4 } from "uuid";
 import { deleteMedia, uploadMedia } from "../../db/object-storage";
 import { logger } from "../../utils/logger";
 import { classifyUpload } from "../../utils/media-types";
+import { rateLimitByIp } from "../../middleware/rate-limit";
+import { setAgentTyping } from "./agent-typing";
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -59,12 +63,17 @@ function parseListFilters(req: AuthedRequest): ConversationFilters {
   if (assignedTo && assignedTo !== "me" && assignedTo !== "unassigned" && !isUuid(assignedTo)) {
     throw httpError(400, "assignedTo must be 'me', 'unassigned' or a user id");
   }
-  if (teamId && !isUuid(teamId)) throw httpError(400, "teamId must be a team id");
+  if (teamId && teamId !== "mine" && !isUuid(teamId)) {
+    throw httpError(400, "teamId must be a team id or 'mine'");
+  }
 
+  // `teamId=mine` means "any team I belong to"; API keys have no teams, so it matches nothing for them.
+  const callerIsUser = isUuid(req.auth!.userId);
   return {
     status: status as ConversationStatus | undefined,
     assignedTo: assignedTo === "me" ? req.auth!.userId : assignedTo,
-    teamId,
+    teamId: teamId === "mine" ? undefined : teamId,
+    teamsOfUserId: teamId === "mine" ? (callerIsUser ? req.auth!.userId : "00000000-0000-0000-0000-000000000000") : undefined,
   };
 }
 
@@ -75,12 +84,38 @@ conversationsRouter.get(
   })
 );
 
+/** Counts for the sidebar badge. Declared before `/:id` so "summary" is not read as an id. */
+conversationsRouter.get(
+  "/summary",
+  asyncHandler(async (req: AuthedRequest, res) => {
+    res.json(await getConversationSummary(req.auth!.tenantId, req.auth!.userId));
+  })
+);
+
 conversationsRouter.get(
   "/:id",
   asyncHandler(async (req: AuthedRequest, res) => {
-    const conv = await getConversation(req.auth!.tenantId, req.params.id);
+    const conv = await getConversation(req.auth!.tenantId, conversationIdOf(req), {
+      includeHandoffContext: true,
+    });
     if (!conv) return res.status(404).json({ error: "Conversation not found" });
     res.json(conv);
+  })
+);
+
+/** The agent started/stopped typing; webchat visitors see "agent is typing". */
+conversationsRouter.post(
+  "/:id/typing",
+  canWorkConversations,
+  rateLimitByIp("agent-typing", 300, 60),
+  asyncHandler(async (req: AuthedRequest, res) => {
+    const conversationId = conversationIdOf(req);
+    const tenantId = req.auth!.tenantId;
+    if (!(await conversationExists(tenantId, conversationId))) {
+      return res.status(404).json({ error: "Conversation not found" });
+    }
+    await setAgentTyping(tenantId, conversationId, req.body?.isTyping === true);
+    res.json({ success: true });
   })
 );
 
@@ -94,6 +129,7 @@ conversationsRouter.get(
 
 conversationsRouter.post(
   "/:id/messages",
+  canWorkConversations, // viewers are read-only
   asyncHandler(async (req: AuthedRequest, res) => {
     const {
       text,
@@ -212,6 +248,7 @@ conversationsRouter.post(
  */
 conversationsRouter.post(
   "/:id/template",
+  canWorkConversations, // viewers are read-only
   asyncHandler(async (req: AuthedRequest, res) => {
     const { templateName, templateLanguage, templateParams, headerType, headerValue, mediaStorageKey, filename } = req.body || {};
     if (!templateName) {

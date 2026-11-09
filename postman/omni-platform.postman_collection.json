@@ -659,6 +659,123 @@
       "description": "Run folder 3 (Webhooks) first.",
       "item": [
         {
+          "name": "Conversation Counts (sidebar badge)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/conversations/summary",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "conversations",
+                "summary"
+              ]
+            },
+            "description": "Returns { pending, unassigned, mine, waitingForMe } for non-closed conversations of the caller's workspace. waitingForMe = pending chats assigned to the caller, or unassigned with no team or one of the caller's teams."
+          },
+          "response": []
+        },
+        {
+          "name": "Agent Typing (webchat visitors see it)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"isTyping\": true\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/conversations/{{conversationId}}/typing",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "conversations",
+                "{{conversationId}}",
+                "typing"
+              ]
+            },
+            "description": "Roles owner/admin/agent. The flag lapses on its own after about 6 seconds, so re-send while typing. 404 for another workspace's conversation."
+          },
+          "response": []
+        },
+        {
+          "name": "Get Auto-assign Setting",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/teams/settings",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "teams",
+                "settings"
+              ]
+            },
+            "description": "{ autoAssignEnabled }: when true, a flow hand-off is assigned to the least busy active agent (the hand-off node's team, else all active agents)."
+          },
+          "response": []
+        },
+        {
+          "name": "Set Auto-assign Setting",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"autoAssignEnabled\": true\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/teams/settings",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "teams",
+                "settings"
+              ]
+            },
+            "description": "Owners and admins only (403 otherwise). 400 unless autoAssignEnabled is a boolean. Audited as tenant.auto_assign_changed."
+          },
+          "response": []
+        },
+        {
           "name": "List Conversations",
           "request": {
             "method": "GET",

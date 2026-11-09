@@ -6,6 +6,7 @@ import {
   touchLastInboundAt,
   getConversation,
   claimOnHumanReply,
+  pauseBotForConversation,
   reopenOnCustomerMessage,
 } from "../conversations/conversations.service";
 import { getChannelWithCredentials } from "../channels/channels.service";
@@ -18,6 +19,7 @@ import {
   signedMediaUrl,
   tenantOwnsKey,
 } from "../media/media.service";
+import { isUuid } from "../../utils/http-error";
 import { indexMessage } from "../search/search.service";
 import { emitRealtimeEvent } from "../realtime/websocket.service";
 import { dispatchWebhookEvent } from "../webhooks/outgoing-webhooks.service";
@@ -355,14 +357,11 @@ export async function sendOutboundMessage(params: {
   await touchLastMessageAt(conversationId);
 
   if (senderUserId) {
-    // When a human agent sends a message from the inbox, pause/hand off any active flow run
-    // so automated bot flows don't collide with the human agent.
-    try {
-      await query(
-        "UPDATE flow_runs SET status = 'handed_off', updated_at = now() WHERE conversation_id = $1 AND status = 'running'",
-        [conversationId]
-      );
-    } catch {}
+    // When a human agent sends a message from the inbox the bot steps aside, so automated flows
+    // don't collide with the agent (also when no flow run is active at this moment).
+    await pauseBotForConversation(tenantId, conversationId).catch((err) => {
+      console.error("[messages] Could not pause the bot after an agent reply (non-fatal):", err?.message);
+    });
 
     // The agent who replies owns an unassigned case, and a pending case becomes open.
     await claimOnHumanReply(tenantId, conversationId, senderUserId).catch((err) => {
@@ -370,17 +369,20 @@ export async function sendOutboundMessage(params: {
     });
   }
 
-  // Update SLA metrics: record first response time if this is the initial outbound message
-  try {
-    await query(
-      `UPDATE conversations
-       SET first_response_at = COALESCE(first_response_at, now()),
-           first_response_duration_seconds = COALESCE(first_response_duration_seconds, EXTRACT(EPOCH FROM (now() - created_at))::INTEGER)
-       WHERE id = $1 AND tenant_id = $2 AND first_response_at IS NULL`,
-      [conversationId, tenantId]
-    );
-  } catch (err: any) {
-    console.error("[messages] Failed to update conversation SLA first response metrics (non-fatal):", err?.message);
+  // SLA: the first response is the first reply from a person. Bot and flow messages have no sender
+  // user, so they no longer count; API-key senders are programmatic and do not count either.
+  if (senderUserId && isUuid(senderUserId)) {
+    try {
+      await query(
+        `UPDATE conversations
+         SET first_response_at = COALESCE(first_response_at, now()),
+             first_response_duration_seconds = COALESCE(first_response_duration_seconds, EXTRACT(EPOCH FROM (now() - created_at))::INTEGER)
+         WHERE id = $1 AND tenant_id = $2 AND first_response_at IS NULL`,
+        [conversationId, tenantId]
+      );
+    } catch (err: any) {
+      console.error("[messages] Failed to update conversation SLA first response metrics (non-fatal):", err?.message);
+    }
   }
 
   const message = toMessage(doc);

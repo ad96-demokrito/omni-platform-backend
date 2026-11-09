@@ -4,6 +4,8 @@
  * asynchronous delivery receipts, Wait/Delay timers, and retry loops.
  */
 
+import { isUuid } from "../../utils/http-error";
+
 export interface TemplateButtonAction {
   buttonText: string;
   next: string;
@@ -137,9 +139,37 @@ export type IntentRouterNode = {
   position?: NodePosition;
 };
 
+export const HANDOFF_PRIORITIES = ["normal", "high", "urgent"] as const;
+export type HandoffPriority = (typeof HANDOFF_PRIORITIES)[number];
+
+/** `default` follows the workspace auto-assign switch; the others override it for this node. */
+export const HANDOFF_ASSIGN_MODES = ["default", "auto", "none"] as const;
+export type HandoffAssignMode = (typeof HANDOFF_ASSIGN_MODES)[number];
+
+export const HANDOFF_LIMITS = {
+  customerMessage: 1000,
+  reason: 200,
+  timeoutMessage: 1000,
+  maxTimeoutMinutes: 1440,
+} as const;
+
 export type HandoffNode = {
   id: string;
   type: "handoff";
+  /** Support team the case is routed to (also the pool for auto-assign). */
+  teamId?: string;
+  /** A specific agent; always wins over auto-assign. */
+  agentUserId?: string;
+  assignMode?: HandoffAssignMode;
+  /** Sent to the customer at hand-off; supports {{variables}}. */
+  customerMessage?: string;
+  /** Shown to agents in the inbox. */
+  reason?: string;
+  priority?: HandoffPriority;
+  /** Resume the bot if nobody has taken the case after this many minutes (0/undefined = never). */
+  timeoutMinutes?: number;
+  /** Sent to the customer when the timeout resumes the bot. */
+  timeoutMessage?: string;
   ports?: NodePort[];
   position?: NodePosition;
 };
@@ -169,6 +199,45 @@ export interface FlowDefinition {
   entryNodeId: string;
   nodes: FlowNode[];
   edges?: FlowEdge[];
+}
+
+/** Checks the optional hand-off settings; a node with none of them is valid (old behaviour). */
+function validateHandoffNode(node: HandoffNode, errors: string[]): void {
+  const label = `Node "${node.id}" (handoff)`;
+  const optionalText = (value: unknown, field: string, max: number): void => {
+    if (value === undefined || value === null || value === "") return;
+    if (typeof value !== "string" || value.length > max) {
+      errors.push(`${label} ${field} must be text of at most ${max} characters`);
+    }
+  };
+  const optionalUuid = (value: unknown, field: string): void => {
+    if (value === undefined || value === null || value === "") return;
+    if (!isUuid(value)) errors.push(`${label} ${field} is not a valid id`);
+  };
+
+  optionalUuid(node.teamId, "teamId");
+  optionalUuid(node.agentUserId, "agentUserId");
+  optionalText(node.customerMessage, "customerMessage", HANDOFF_LIMITS.customerMessage);
+  optionalText(node.reason, "reason", HANDOFF_LIMITS.reason);
+  optionalText(node.timeoutMessage, "timeoutMessage", HANDOFF_LIMITS.timeoutMessage);
+
+  if (node.assignMode !== undefined && !(HANDOFF_ASSIGN_MODES as readonly string[]).includes(node.assignMode)) {
+    errors.push(`${label} assignMode must be one of: ${HANDOFF_ASSIGN_MODES.join(", ")}`);
+  }
+  if (node.priority !== undefined && !(HANDOFF_PRIORITIES as readonly string[]).includes(node.priority)) {
+    errors.push(`${label} priority must be one of: ${HANDOFF_PRIORITIES.join(", ")}`);
+  }
+  if (node.timeoutMinutes !== undefined) {
+    const minutes = node.timeoutMinutes;
+    if (
+      typeof minutes !== "number" ||
+      !Number.isInteger(minutes) ||
+      minutes < 0 ||
+      minutes > HANDOFF_LIMITS.maxTimeoutMinutes
+    ) {
+      errors.push(`${label} timeoutMinutes must be a whole number from 0 to ${HANDOFF_LIMITS.maxTimeoutMinutes}`);
+    }
+  }
 }
 
 export function validateFlowDefinition(
@@ -264,6 +333,8 @@ export function validateFlowDefinition(
         node.ports?.forEach((p) => checkNext(p.next));
         break;
       case "handoff":
+        validateHandoffNode(node, errors);
+        break;
       case "end":
         break;
       default:
