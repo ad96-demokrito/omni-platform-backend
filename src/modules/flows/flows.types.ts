@@ -5,6 +5,7 @@
  */
 
 import { isUuid } from "../../utils/http-error";
+import { CarouselCardInput, normalizeCarouselCards } from "../channels/carousel-send";
 
 export interface TemplateButtonAction {
   buttonText: string;
@@ -91,6 +92,8 @@ export type TemplateNode = {
   headerValue?: string; // static URL or {{variable}} or text
   mediaStorageKey?: string; // S3/MinIO key for uploaded template media asset
   filename?: string;
+  /** Per-card media, variables and button params when the template is a media-card carousel. */
+  carouselCards?: CarouselCardInput[];
   buttons?: TemplateButtonAction[];
   waitForDelivery?: boolean;
   onDelivered?: string;
@@ -300,6 +303,13 @@ export function validateFlowDefinition(
         break;
       case "template":
         if (!node.templateName) errors.push(`Node "${node.id}" (template) is missing templateName`);
+        if (node.carouselCards !== undefined) {
+          try {
+            normalizeCarouselCards(node.carouselCards);
+          } catch (err) {
+            errors.push(`Node "${node.id}" (template) carousel: ${err instanceof Error ? err.message : "invalid cards"}`);
+          }
+        }
         if (node.buttons && Array.isArray(node.buttons)) {
           node.buttons.forEach((btn, idx) => {
             if (!btn.buttonText) errors.push(`Node "${node.id}" (template) button ${idx} is missing buttonText`);

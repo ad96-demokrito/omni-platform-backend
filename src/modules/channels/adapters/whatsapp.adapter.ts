@@ -1,5 +1,11 @@
 import crypto from "crypto";
-import { ChannelAdapter, NormalizedMessage, OutboundMessage, MessageStatusUpdate } from "./channel-adapter.interface";
+import {
+  ChannelAdapter,
+  NormalizedMessage,
+  OutboundCarouselCard,
+  OutboundMessage,
+  MessageStatusUpdate,
+} from "./channel-adapter.interface";
 
 /**
  * WhatsApp adapter, written against the Meta Cloud API webhook shape (most
@@ -318,6 +324,46 @@ function extractInteractiveReplyText(msg: any): string | undefined {
   return interactive?.button_reply?.title ?? interactive?.list_reply?.title;
 }
 
+/** Parameters of one carousel card (header media, body variables, button values). */
+function buildCarouselCard(card: OutboundCarouselCard, cardIndex: number) {
+  const mediaType = card.headerType.toLowerCase();
+  const components: Record<string, unknown>[] = [
+    {
+      type: "header",
+      parameters: [{ type: mediaType, [mediaType]: { link: card.headerValue } }],
+    },
+  ];
+
+  if (card.bodyParams && card.bodyParams.length > 0) {
+    components.push({
+      type: "body",
+      parameters: card.bodyParams.map((text) => ({ type: "text", text })),
+    });
+  }
+
+  for (const button of card.buttons ?? []) {
+    if (button.subType === "quick_reply") {
+      // The payload comes back on the tap; use the label so flows can branch on it like any other reply.
+      const payload = button.param || button.text || `card${cardIndex + 1}_button${button.index + 1}`;
+      components.push({
+        type: "button",
+        sub_type: "quick_reply",
+        index: String(button.index),
+        parameters: [{ type: "payload", payload }],
+      });
+    } else if (button.param) {
+      components.push({
+        type: "button",
+        sub_type: "url",
+        index: String(button.index),
+        parameters: [{ type: "text", text: button.param }],
+      });
+    }
+  }
+
+  return { card_index: cardIndex, components };
+}
+
 function buildOutboundBody(message: OutboundMessage) {
   const base = {
     messaging_product: "whatsapp",
@@ -370,6 +416,14 @@ function buildOutboundBody(message: OutboundMessage) {
           type: "text",
           text: message.templateParams![k],
         })),
+      });
+    }
+
+    // Media-card carousel: one entry per card, in the template's card order.
+    if (message.carouselCards && message.carouselCards.length > 0) {
+      components.push({
+        type: "carousel",
+        cards: message.carouselCards.map((card, cardIndex) => buildCarouselCard(card, cardIndex)),
       });
     }
 

@@ -16,6 +16,24 @@ export interface NormalizedMessage {
   receivedAt: Date;
 }
 
+/** A button parameter of a carousel card; `index` is the button's position on the template card. */
+export interface OutboundCarouselButton {
+  index: number;
+  subType: "quick_reply" | "url";
+  /** URL suffix for a url button; payload for a quick_reply (defaults to `text`). */
+  param?: string;
+  /** Label of the button, used as the quick-reply payload so a tap comes back as that text. */
+  text?: string;
+}
+
+/** One card of a carousel template send. Media is already resolved to a URL Meta can fetch. */
+export interface OutboundCarouselCard {
+  headerType: "IMAGE" | "VIDEO";
+  headerValue: string;
+  bodyParams?: string[];
+  buttons?: OutboundCarouselButton[];
+}
+
 export interface OutboundMessage {
   toExternalContactId: string;
   type: "text" | "image" | "document" | "audio" | "video" | "sticker" | "template" | "product" | "product_list";
@@ -27,6 +45,8 @@ export interface OutboundMessage {
   templateParams?: Record<string, string>;
   headerType?: "TEXT" | "IMAGE" | "DOCUMENT" | "VIDEO";
   headerValue?: string;
+  /** Cards of a media-card carousel template; the card count must match the template. */
+  carouselCards?: OutboundCarouselCard[];
   catalogId?: string;
   productRetailerId?: string;
   sections?: Array<{

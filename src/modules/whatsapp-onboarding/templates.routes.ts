@@ -3,6 +3,8 @@ import { AuthedRequest, requireAuth, requireRole } from "../../middleware/auth";
 import { asyncHandler } from "../../middleware/async-handler";
 import { getChannelWithCredentials } from "../channels/channels.service";
 import { listTemplates, createTemplate } from "./templates.service";
+import { collectMediaStorageKeys, validateCarouselTemplate } from "./carousel-template";
+import { isSafeMediaKey, tenantOwnsKey } from "../media/media.service";
 import { Logger } from "../../utils/logger";
 
 const log = new Logger("templates");
@@ -71,6 +73,19 @@ templatesRouter.post(
     const { name, language, category, components } = req.body || {};
     if (!name || !language || !category || !Array.isArray(components)) {
       return res.status(400).json({ error: "name, language, category, and components are required" });
+    }
+
+    // Header sample files are read from object storage by key: they must belong to this tenant.
+    const tenantId = req.auth!.tenantId;
+    for (const key of collectMediaStorageKeys(components)) {
+      if (!isSafeMediaKey(key) || !tenantOwnsKey(tenantId, key)) {
+        return res.status(404).json({ error: "Media file not found" });
+      }
+    }
+
+    const carouselError = validateCarouselTemplate(category, components);
+    if (carouselError) {
+      return res.status(400).json({ error: carouselError, code: "INVALID_CAROUSEL_TEMPLATE" });
     }
 
     try {

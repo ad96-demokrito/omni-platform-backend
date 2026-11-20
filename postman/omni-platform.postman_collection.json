@@ -1909,6 +1909,96 @@
               }
             }
           ]
+        },
+        {
+          "name": "Create Carousel Template",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/channels/{{embeddedSignupChannelId}}/templates",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "channels",
+                "{{embeddedSignupChannelId}}",
+                "templates"
+              ]
+            },
+            "description": "Media-card carousel (MARKETING only): body + 2-10 cards, each with an IMAGE/VIDEO header, optional body and 1-2 buttons (QUICK_REPLY/URL/PHONE_NUMBER). All cards must share the same structure. mediaStorageKey values come from POST /api/media/upload and must belong to your tenant (404 otherwise). Validation errors return 400 with code INVALID_CAROUSEL_TEMPLATE.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"postman_carousel_template\",\n  \"language\": \"en_US\",\n  \"category\": \"MARKETING\",\n  \"components\": [\n    {\n      \"type\": \"BODY\",\n      \"text\": \"This week's picks, just for you!\"\n    },\n    {\n      \"type\": \"CAROUSEL\",\n      \"cards\": [\n        {\n          \"components\": [\n            {\n              \"type\": \"HEADER\",\n              \"format\": \"IMAGE\",\n              \"mediaStorageKey\": \"{{tenantId}}/templates/card1.jpg\",\n              \"example\": {\n                \"header_handle\": [\n                  \"https://example.com/card1.jpg\"\n                ]\n              }\n            },\n            {\n              \"type\": \"BODY\",\n              \"text\": \"Item 1 — use code {{1}} at checkout\",\n              \"example\": {\n                \"body_text\": [\n                  [\n                    \"SAVE10\"\n                  ]\n                ]\n              }\n            },\n            {\n              \"type\": \"BUTTONS\",\n              \"buttons\": [\n                {\n                  \"type\": \"QUICK_REPLY\",\n                  \"text\": \"Buy now\"\n                },\n                {\n                  \"type\": \"URL\",\n                  \"text\": \"View item\",\n                  \"url\": \"https://shop.example.com/item/{{1}}\",\n                  \"example\": [\n                    \"https://shop.example.com/item/101\"\n                  ]\n                }\n              ]\n            }\n          ]\n        },\n        {\n          \"components\": [\n            {\n              \"type\": \"HEADER\",\n              \"format\": \"IMAGE\",\n              \"mediaStorageKey\": \"{{tenantId}}/templates/card2.jpg\",\n              \"example\": {\n                \"header_handle\": [\n                  \"https://example.com/card2.jpg\"\n                ]\n              }\n            },\n            {\n              \"type\": \"BODY\",\n              \"text\": \"Item 2 — use code {{1}} at checkout\",\n              \"example\": {\n                \"body_text\": [\n                  [\n                    \"SAVE10\"\n                  ]\n                ]\n              }\n            },\n            {\n              \"type\": \"BUTTONS\",\n              \"buttons\": [\n                {\n                  \"type\": \"QUICK_REPLY\",\n                  \"text\": \"Buy now\"\n                },\n                {\n                  \"type\": \"URL\",\n                  \"text\": \"View item\",\n                  \"url\": \"https://shop.example.com/item/{{1}}\",\n                  \"example\": [\n                    \"https://shop.example.com/item/102\"\n                  ]\n                }\n              ]\n            }\n          ]\n        }\n      ]\n    }\n  ]\n}"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 201', () => pm.response.code === 201);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Send Carousel Template (Inbox)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/conversations/{{conversationId}}/template",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "conversations",
+                "{{conversationId}}",
+                "template"
+              ]
+            },
+            "description": "Sends an APPROVED carousel template. carouselCards must have one entry per template card, in order: headerType, mediaStorageKey (or headerValue URL), bodyParams (values for the card body {{1}}..), and buttons ([{index, subType: quick_reply|url, param (url suffix) , text}]). Invalid cards return 400.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"templateName\": \"postman_carousel_template\",\n  \"templateLanguage\": \"en_US\",\n  \"templateParams\": {},\n  \"carouselCards\": [\n    {\n      \"headerType\": \"IMAGE\",\n      \"mediaStorageKey\": \"{{tenantId}}/templates/card1.jpg\",\n      \"bodyParams\": [\n        \"SAVE10\"\n      ],\n      \"buttons\": [\n        {\n          \"index\": 0,\n          \"subType\": \"quick_reply\",\n          \"text\": \"Buy now\"\n        },\n        {\n          \"index\": 1,\n          \"subType\": \"url\",\n          \"param\": \"101\"\n        }\n      ]\n    },\n    {\n      \"headerType\": \"IMAGE\",\n      \"mediaStorageKey\": \"{{tenantId}}/templates/card2.jpg\",\n      \"bodyParams\": [\n        \"SAVE10\"\n      ],\n      \"buttons\": [\n        {\n          \"index\": 0,\n          \"subType\": \"quick_reply\",\n          \"text\": \"Buy now\"\n        },\n        {\n          \"index\": 1,\n          \"subType\": \"url\",\n          \"param\": \"102\"\n        }\n      ]\n    }\n  ]\n}"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 201', () => pm.response.code === 201);"
+                ]
+              }
+            }
+          ]
         }
       ]
     },

@@ -230,6 +230,7 @@ export async function runFlowForConversation(params: {
             headerValue: msg.headerValue,
             mediaStorageKey: msg.mediaStorageKey,
             filename: msg.filename,
+            carouselCards: msg.carouselCards,
           });
           lastProviderMessageId = sent.provider_message_id;
           firstProviderMessageId ??= sent.provider_message_id;
@@ -366,6 +367,7 @@ export async function handleDeliveryStatusCallback(params: {
           headerValue: msg.headerValue,
           mediaStorageKey: msg.mediaStorageKey,
           filename: msg.filename,
+          carouselCards: msg.carouselCards,
         });
       }
     }

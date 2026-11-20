@@ -7,6 +7,7 @@ import {
   HandoffAssignMode,
   HandoffPriority,
 } from "./flows.types";
+import { CarouselCardInput, mapCarouselCardTexts } from "../channels/carousel-send";
 import { RAGService } from "../ai/rag.service";
 import { CopilotService } from "../ai/copilot.service";
 
@@ -20,6 +21,7 @@ export interface OutboundFlowMessage {
   headerValue?: string;
   mediaStorageKey?: string;
   filename?: string;
+  carouselCards?: CarouselCardInput[];
   nodeId?: string;
   waitForDelivery?: boolean;
 }
@@ -268,6 +270,9 @@ async function runFlowSteps(
           headerValue: interpolatedHeaderValue,
           mediaStorageKey: node.mediaStorageKey,
           filename: node.filename,
+          carouselCards: node.carouselCards
+            ? mapCarouselCardTexts(node.carouselCards, (value) => interpolate(value, variables))
+            : undefined,
           nodeId: node.id,
           waitForDelivery: shouldWaitForDelivery,
         });

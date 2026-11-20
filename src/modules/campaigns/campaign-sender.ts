@@ -27,6 +27,7 @@ import { logger } from "../../utils/logger";
 import { runFlowForConversation, FlowRunSkipReason } from "../flows/flow-engine-runner";
 import { getFlow } from "../flows/flows.service";
 import { resolveHeaderMediaUrl } from "../../db/object-storage";
+import { mapCarouselCardTexts, prepareCarouselForSend } from "../channels/carousel-send";
 import { syncRecipientWithMessageStatus } from "./campaign-delivery-sync";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -159,6 +160,14 @@ export async function sendBroadcastNow(
             }
           }
 
+          // Carousel cards: {{name}}-style tokens are filled per recipient, media is signed fresh.
+          const carousel = definition.carouselCards
+            ? await prepareCarouselForSend(
+                tenantId,
+                mapCarouselCardTexts(definition.carouselCards, (value) => interpolate(value, recipientVars))
+              )
+            : undefined;
+
           const templateResult = await adapter.send(
             {
               toExternalContactId: recipient.external_id,
@@ -169,6 +178,7 @@ export async function sendBroadcastNow(
               headerType: definition.headerType,
               headerValue: resolvedHeaderValue,
               filename: definition.filename,
+              carouselCards: carousel?.outbound,
             },
             channel.credentials || {}
           );

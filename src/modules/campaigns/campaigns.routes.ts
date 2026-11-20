@@ -17,6 +17,12 @@ import {
   campaignExportFileName,
 } from "./campaign-export";
 import { AuditService } from "../audit/audit.service";
+import {
+  CarouselCardInput,
+  assertTenantOwnsCarouselMedia,
+  normalizeCarouselCards,
+} from "../channels/carousel-send";
+import { isSafeMediaKey, tenantOwnsKey } from "../media/media.service";
 
 const XLSX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 
@@ -144,8 +150,26 @@ campaignsRouter.post(
       dripSteps = normalized.steps;
     }
 
+    // Uploaded template media is read from object storage by key: it must be this tenant's own file.
+    let carouselCards: CarouselCardInput[] | undefined;
+    if (type === "broadcast") {
+      try {
+        if (definition?.carouselCards !== undefined) {
+          carouselCards = normalizeCarouselCards(definition.carouselCards);
+          assertTenantOwnsCarouselMedia(req.auth!.tenantId, carouselCards);
+        }
+        const headerKey: unknown = definition?.mediaStorageKey;
+        if (headerKey !== undefined && !(isSafeMediaKey(headerKey) && tenantOwnsKey(req.auth!.tenantId, headerKey))) {
+          return res.status(400).json({ error: "Invalid media reference" });
+        }
+      } catch (err) {
+        return res.status(400).json({ error: err instanceof Error ? err.message : "Invalid carousel cards" });
+      }
+    }
+
     const mergedDefinition = {
       ...definition,
+      ...(carouselCards ? { carouselCards } : {}),
       ...(dripSteps ? { steps: dripSteps } : {}),
       ...(type === "flow" && req.body.flowId ? { flowId: req.body.flowId } : {}),
       ...(type === "broadcast" && req.body.message ? { text: req.body.message } : {}),

@@ -12,6 +12,8 @@ import {
 import { getChannelWithCredentials } from "../channels/channels.service";
 import { getAdapter } from "../channels/channel-registry";
 import { resolveHeaderMediaUrl } from "../../db/object-storage";
+import type { OutboundCarouselCard } from "../channels/adapters/channel-adapter.interface";
+import { CarouselCardInput, prepareCarouselForSend } from "../channels/carousel-send";
 import {
   isSafeMediaKey,
   keyFromMediaUrl,
@@ -89,6 +91,19 @@ interface MessageStatusEventDoc {
   timestamp: Date;
 }
 
+/** Re-links each carousel card's stored file with a fresh signed URL (stored URLs would go stale). */
+function withSignedCarouselMedia(content: Record<string, any>): Record<string, any> {
+  const cards: unknown = content?.carouselCards;
+  if (!Array.isArray(cards)) return content;
+  return {
+    ...content,
+    carouselCards: cards.map((card: Record<string, any>) => ({
+      ...card,
+      mediaUrl: isSafeMediaKey(card?.mediaStorageKey) ? signedMediaUrl(card.mediaStorageKey) : card?.headerValue,
+    })),
+  };
+}
+
 function toMessage(doc: MessageDoc): Message {
   // Older webchat uploads were saved with type "file"; every consumer understands "document".
   const type = doc.type === "file" ? "document" : doc.type;
@@ -123,7 +138,7 @@ function toMessage(doc: MessageDoc): Message {
     text,
     mediaUrl,
     mediaStorageKey,
-    content: doc.content,
+    content: withSignedCarouselMedia(doc.content),
     sender_user_id: doc.senderUserId,
     senderUserId: doc.senderUserId,
     senderType: doc.direction === "inbound" ? "customer" : (doc.senderUserId ? "agent" : "bot"),
@@ -237,6 +252,8 @@ export async function sendOutboundMessage(params: {
   templateParams?: Record<string, string>;
   headerType?: "TEXT" | "IMAGE" | "DOCUMENT" | "VIDEO";
   headerValue?: string;
+  /** Cards of a media-card carousel template (see channels/carousel-send.ts); validated here. */
+  carouselCards?: unknown;
 }): Promise<Message> {
   const {
     tenantId,
@@ -250,6 +267,7 @@ export async function sendOutboundMessage(params: {
     templateParams,
     headerType,
     headerValue,
+    carouselCards,
   } = params;
   let { mediaUrl, mediaStorageKey } = params;
 
@@ -273,11 +291,18 @@ export async function sendOutboundMessage(params: {
   const adapter = getAdapter(channel.type);
 
   let providerMessageId: string | undefined;
+  let storedCarouselCards: CarouselCardInput[] | undefined;
 
   if (type === "template") {
     // Send WhatsApp template message
     if (!templateName) throw new Error("templateName is required for template messages");
     const resolvedHeaderValue = await resolveHeaderMediaUrl(mediaStorageKey, headerValue);
+    let outboundCarouselCards: OutboundCarouselCard[] | undefined;
+    if (carouselCards !== undefined && carouselCards !== null) {
+      const prepared = await prepareCarouselForSend(tenantId, carouselCards);
+      storedCarouselCards = prepared.stored;
+      outboundCarouselCards = prepared.outbound;
+    }
     const result = await adapter.send(
       {
         toExternalContactId: conversation.contact_external_id,
@@ -288,6 +313,7 @@ export async function sendOutboundMessage(params: {
         headerType,
         headerValue: resolvedHeaderValue,
         filename,
+        carouselCards: outboundCarouselCards,
       },
       channel.credentials || {}
     );
@@ -331,6 +357,8 @@ export async function sendOutboundMessage(params: {
       headerValue: mediaStorageKey ? `/api/media/file?key=${encodeURIComponent(mediaStorageKey)}` : headerValue,
       mediaStorageKey,
       filename,
+      // Cards keep their storage keys, never signed URLs (those expire); toMessage re-signs on read.
+      ...(storedCarouselCards ? { carouselCards: storedCarouselCards } : {}),
     };
   } else if (type === "text") {
     content = { text };

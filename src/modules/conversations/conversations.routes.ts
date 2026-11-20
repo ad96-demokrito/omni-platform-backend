@@ -142,6 +142,7 @@ conversationsRouter.post(
       templateParams,
       headerType,
       headerValue,
+      carouselCards,
     } = req.body || {};
 
     if (type === "text" && (!text || !text.trim())) {
@@ -163,6 +164,7 @@ conversationsRouter.post(
         templateParams,
         headerType,
         headerValue,
+        carouselCards,
       });
       res.status(201).json(message);
     } catch (err: any) {
@@ -250,7 +252,16 @@ conversationsRouter.post(
   "/:id/template",
   canWorkConversations, // viewers are read-only
   asyncHandler(async (req: AuthedRequest, res) => {
-    const { templateName, templateLanguage, templateParams, headerType, headerValue, mediaStorageKey, filename } = req.body || {};
+    const {
+      templateName,
+      templateLanguage,
+      templateParams,
+      headerType,
+      headerValue,
+      mediaStorageKey,
+      filename,
+      carouselCards,
+    } = req.body || {};
     if (!templateName) {
       return res.status(400).json({ error: "templateName is required" });
     }
@@ -268,6 +279,7 @@ conversationsRouter.post(
         headerValue,
         mediaStorageKey,
         filename,
+        carouselCards,
       });
       res.status(201).json(message);
     } catch (err: any) {

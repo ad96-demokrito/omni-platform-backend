@@ -1,3 +1,5 @@
+import type { CarouselCardInput } from "../channels/carousel-send";
+
 export interface BroadcastDefinition {
   text?: string; // supports {{name}} interpolation against the contact's name
   flowId?: string; // If set, this broadcast runs a Visual Flow for each recipient
@@ -9,6 +11,8 @@ export interface BroadcastDefinition {
   headerValue?: string;
   mediaStorageKey?: string;
   filename?: string;
+  /** Per-card media, variables and button params for a media-card carousel template. */
+  carouselCards?: CarouselCardInput[];
 }
 
 export interface FlowCampaignDefinition {
