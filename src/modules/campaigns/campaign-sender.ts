@@ -1,4 +1,3 @@
-import { getAdapter } from "../channels/channel-registry";
 import { getChannelWithCredentials, getChannelByIdUnscoped } from "../channels/channels.service";
 import {
   getCampaign,
@@ -26,8 +25,7 @@ import { sendOutboundMessage } from "../messages/messages.service";
 import { logger } from "../../utils/logger";
 import { runFlowForConversation, FlowRunSkipReason } from "../flows/flow-engine-runner";
 import { getFlow } from "../flows/flows.service";
-import { resolveHeaderMediaUrl } from "../../db/object-storage";
-import { mapCarouselCardTexts, prepareCarouselForSend } from "../channels/carousel-send";
+import { mapCarouselCardTexts } from "../channels/carousel-send";
 import { syncRecipientWithMessageStatus } from "./campaign-delivery-sync";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -143,15 +141,22 @@ export async function sendBroadcastNow(
             sent++;
           }
         } else if (definition.templateName) {
-          // 2. WhatsApp Template broadcast with optional media header
-          const adapter = getAdapter(channel.type);
-          // An uploaded header is signed fresh from its storage key on every send; the URL saved at
-          // upload time expires, so a campaign sent days later would otherwise carry a dead link.
-          const resolvedHeaderValue = definition.mediaStorageKey
-            ? await resolveHeaderMediaUrl(definition.mediaStorageKey, definition.headerValue)
-            : definition.headerValue
-            ? interpolate(definition.headerValue, recipientVars)
-            : undefined;
+          // 2. WhatsApp Template broadcast with optional media header. It goes through the
+          // conversation (like drip and flow sends) so the message is stored: it then shows in the
+          // team inbox and picks up delivered/read receipts.
+          const conversation = await findOrCreateOpenConversation({
+            tenantId,
+            contactId: recipient.contact_id,
+            channelId: campaign.channel_id,
+          });
+
+          // An uploaded header is signed fresh from its storage key on every send (sendOutboundMessage);
+          // the URL saved at upload time expires, so a campaign sent days later would carry a dead link.
+          // Without a stored file, a pasted URL / {{variable}} is filled in per recipient.
+          const headerValue =
+            !definition.mediaStorageKey && definition.headerValue
+              ? interpolate(definition.headerValue, recipientVars)
+              : definition.headerValue;
 
           const interpolatedParams: Record<string, string> = {};
           if (definition.templateParams) {
@@ -160,39 +165,37 @@ export async function sendBroadcastNow(
             }
           }
 
-          // Carousel cards: {{name}}-style tokens are filled per recipient, media is signed fresh.
-          const carousel = definition.carouselCards
-            ? await prepareCarouselForSend(
-                tenantId,
-                mapCarouselCardTexts(definition.carouselCards, (value) => interpolate(value, recipientVars))
-              )
-            : undefined;
-
-          const templateResult = await adapter.send(
-            {
-              toExternalContactId: recipient.external_id,
-              type: "template",
-              templateName: definition.templateName,
-              templateLanguage: definition.templateLanguage || "en",
-              templateParams: interpolatedParams,
-              headerType: definition.headerType,
-              headerValue: resolvedHeaderValue,
-              filename: definition.filename,
-              carouselCards: carousel?.outbound,
-            },
-            channel.credentials || {}
-          );
-          await recordAcceptedSend(recipient.id, tenantId, templateResult.providerMessageId);
+          const sentMessage = await sendOutboundMessage({
+            tenantId,
+            conversationId: conversation.id,
+            type: "template",
+            templateName: definition.templateName,
+            templateLanguage: definition.templateLanguage || "en",
+            templateParams: interpolatedParams,
+            headerType: definition.headerType,
+            headerValue,
+            mediaStorageKey: definition.mediaStorageKey,
+            filename: definition.filename,
+            // Carousel cards: {{name}}-style tokens are filled per recipient.
+            carouselCards: definition.carouselCards
+              ? mapCarouselCardTexts(definition.carouselCards, (value) => interpolate(value, recipientVars))
+              : undefined,
+          });
+          await recordAcceptedSend(recipient.id, tenantId, sentMessage.provider_message_id);
           sent++;
         } else {
-          // 3. Standard text broadcast message
-          const adapter = getAdapter(channel.type);
-          const text = interpolate(definition.text || "", recipientVars);
-          const textResult = await adapter.send(
-            { toExternalContactId: recipient.external_id, type: "text", text },
-            channel.credentials || {}
-          );
-          await recordAcceptedSend(recipient.id, tenantId, textResult.providerMessageId);
+          // 3. Standard text broadcast message (also stored in the inbox, see above)
+          const conversation = await findOrCreateOpenConversation({
+            tenantId,
+            contactId: recipient.contact_id,
+            channelId: campaign.channel_id,
+          });
+          const sentMessage = await sendOutboundMessage({
+            tenantId,
+            conversationId: conversation.id,
+            text: interpolate(definition.text || "", recipientVars),
+          });
+          await recordAcceptedSend(recipient.id, tenantId, sentMessage.provider_message_id);
           sent++;
         }
       } catch (err) {
