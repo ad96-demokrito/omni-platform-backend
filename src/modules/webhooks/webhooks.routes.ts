@@ -11,6 +11,7 @@ import { getProductBySku } from "../commerce/products.service";
 import { asyncHandler } from "../../middleware/async-handler";
 import { uploadMedia } from "../../db/object-storage";
 import { Logger } from "../../utils/logger";
+import { parseCarouselReplyPayload } from "../channels/carousel-reply";
 import {
   getChannelByIdUnscoped,
   findWhatsAppChannel,
@@ -219,6 +220,9 @@ async function processInboundWebhook(
       }
     }
 
+    // A tap on a carousel card's quick-reply button says which card it was on (see carousel-reply.ts).
+    const carouselReply = parseCarouselReplyPayload(msg.buttonPayload);
+
     const { isDuplicate } = await recordInboundMessage({
       tenantId: channel.tenant_id,
       conversationId: conversation.id,
@@ -227,6 +231,7 @@ async function processInboundWebhook(
         text: msg.text,
         mediaProviderId: msg.mediaUrl,
         mediaStorageKey: storedMediaKey,
+        ...(carouselReply ? { carouselCard: { index: carouselReply.cardNumber, button: carouselReply.button } } : {}),
         raw: msg.raw,
       },
       sentAt: msg.receivedAt,
@@ -284,6 +289,7 @@ async function processInboundWebhook(
         conversationId: conversation.id,
         defaultFlowId: channel.default_flow_id || null,
         incomingText: msg.text,
+        carouselReply: carouselReply ?? undefined,
       }).catch((err) => {
         log.error(`[webhooks] Flow execution failed for conversation ${conversation.id}:`, err);
       });

@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { buildCarouselReplyPayload } from "../carousel-reply";
 import {
   ChannelAdapter,
   NormalizedMessage,
@@ -95,6 +96,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
             contactName,
             type: mapMessageType(msg.type),
             text,
+            buttonPayload: typeof msg.button?.payload === "string" ? msg.button.payload : undefined,
             mediaUrl: mediaId, // media needs a follow-up media-download call
             providerMessageId: msg.id,
             raw: msg,
@@ -343,8 +345,10 @@ function buildCarouselCard(card: OutboundCarouselCard, cardIndex: number) {
 
   for (const button of card.buttons ?? []) {
     if (button.subType === "quick_reply") {
-      // The payload comes back on the tap; use the label so flows can branch on it like any other reply.
-      const payload = button.param || button.text || `card${cardIndex + 1}_button${button.index + 1}`;
+      // The payload comes back on the tap and names the card, so two cards with the same button
+      // label can be told apart (see carousel-reply.ts). A caller-supplied payload wins.
+      const payload =
+        button.param || buildCarouselReplyPayload(cardIndex + 1, button.text || `button ${button.index + 1}`);
       components.push({
         type: "button",
         sub_type: "quick_reply",

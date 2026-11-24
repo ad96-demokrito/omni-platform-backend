@@ -10,6 +10,8 @@ export interface NormalizedMessage {
   contactName?: string;
   type: "text" | "image" | "document" | "audio" | "video" | "sticker" | "button" | "order" | "unknown";
   text?: string;
+  /** Payload of a tapped template quick-reply button (WhatsApp `button.payload`). */
+  buttonPayload?: string;
   mediaUrl?: string;
   providerMessageId?: string; // provider message identifier (e.g. WhatsApp WAMID, Telegram message_id)
   raw: unknown; // original payload, kept for debugging/audit

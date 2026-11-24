@@ -1,5 +1,6 @@
 import { queryOne } from "../../db/pool";
 import { withLock } from "../../db/redis";
+import type { CarouselReply } from "../channels/carousel-reply";
 import { sendOutboundMessage } from "../messages/messages.service";
 import {
   getActiveFlowRun,
@@ -117,8 +118,10 @@ export async function runFlowForConversation(params: {
   resumeAtNodeId?: string;
   /** Set by the campaign sender so the run's answers can be exported per recipient. */
   campaign?: { campaignId: string; recipientId: string };
+  /** Set when the customer tapped a quick-reply button on a carousel card. */
+  carouselReply?: CarouselReply;
 }): Promise<FlowRunOutcome> {
-  const { tenantId, conversationId, defaultFlowId, incomingText, resumeAtNodeId, campaign } = params;
+  const { tenantId, conversationId, defaultFlowId, incomingText, resumeAtNodeId, campaign, carouselReply } = params;
 
   const result = await withLock<FlowRunOutcome>(`flow-lock:${conversationId}`, 10_000, async () => {
     // A person owns this case (hand-off, assignment, claim or reply): the bot stays out of it.
@@ -190,6 +193,11 @@ export async function runFlowForConversation(params: {
       ...contactAttributes,
       contact: contactScope,
       ...(flowRun.variables || {}),
+      // Which card/button the customer just tapped: usable as {{lastCardIndex}} / {{lastCardButton}}
+      // in messages and conditions.
+      ...(carouselReply
+        ? { lastCardIndex: carouselReply.cardNumber, lastCardButton: carouselReply.button }
+        : {}),
     };
 
     const advance = await advanceFlow(
