@@ -3,6 +3,7 @@ import { KnowledgeBase, KnowledgeChunk, RAGQueryParams, RAGQueryResult } from ".
 import { generateEmbedding, cosineSimilarity } from "./embeddings.service";
 import { AIProvider, ChatMessage } from "./ai.provider";
 import { logger } from "../../utils/logger";
+import { assertAiAllowed } from "../billing/plan-limits.service";
 
 const log = logger.child({ module: "rag-service" });
 
@@ -11,6 +12,7 @@ export class RAGService {
    * Executes a Retrieval-Augmented Generation (RAG) query against a specific Knowledge Base.
    */
   public static async queryKnowledgeBase(params: RAGQueryParams): Promise<RAGQueryResult> {
+    await assertAiAllowed(params.tenantId);
     const startTime = Date.now();
 
     // 1. Fetch Knowledge Base

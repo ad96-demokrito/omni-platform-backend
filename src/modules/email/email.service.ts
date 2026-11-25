@@ -8,6 +8,9 @@ export interface SendEmailOptions {
   text?: string;
   from?: string;
   replyTo?: string;
+  /** Silent copy, for example the accountant's address for invoices. */
+  bcc?: string;
+  attachments?: Array<{ filename: string; content: Buffer; contentType?: string }>;
 }
 
 export interface EmailLogEntry {
@@ -87,6 +90,8 @@ class EmailService {
           html: options.html,
           text: options.text,
           replyTo: options.replyTo,
+          bcc: options.bcc,
+          attachments: options.attachments,
         });
 
         this.addLog({
@@ -313,8 +318,46 @@ class EmailService {
     billingCycle: string;
     periodEnd: string;
     paymentMethod: string;
-  }): Promise<void> {
-    const { to, tenantName, planName, invoiceNumber, amount, currency, billingCycle, periodEnd, paymentMethod } = params;
+    /** Tax split of `amount` (the total charged). */
+    subtotal?: number;
+    taxAmount?: number;
+    taxRate?: number;
+    taxLabel?: string | null;
+    buyerTaxId?: string | null;
+    sellerTaxId?: string | null;
+    sellerLegalName?: string | null;
+    /** The invoice PDF to attach (omitted when INVOICE_PDF_ATTACH is off). */
+    pdf?: { fileName: string; content: Buffer };
+    /** Copy for the accountant (INVOICE_BCC_EMAIL). */
+    bcc?: string;
+    /** An automatic renewal rather than a first purchase. */
+    isRenewal?: boolean;
+  }): Promise<{ success: boolean; simulated: boolean; error?: string }> {
+    const { to, invoiceNumber, amount, currency, billingCycle, periodEnd, paymentMethod } = params;
+    const { subtotal, taxAmount = 0, taxRate = 0, taxLabel, buyerTaxId, sellerTaxId, sellerLegalName } = params;
+    // Names come from users: escape them before they go into HTML.
+    const esc = (value: string): string =>
+      value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    const tenantName = esc(params.tenantName);
+    const planName = esc(params.planName);
+    const money = (value: number): string => `${currency} ${value.toFixed(2)}`;
+    const row = (label: string, value: string, extraStyle = ""): string => `
+              <tr style="border-bottom: 1px solid #e2e8f0;">
+                <td style="padding: 8px 0; color: #64748b;">${label}</td>
+                <td style="padding: 8px 0; color: #0f172a; text-align: right; ${extraStyle}">${value}</td>
+              </tr>`;
+    const taxRows =
+      taxAmount > 0
+        ? row("Subtotal:", money(subtotal ?? amount - taxAmount)) +
+          row(`${esc(taxLabel || "Tax")} (${taxRate}%):`, money(taxAmount))
+        : "";
+    const sellerLines = [
+      sellerLegalName ? `Issued by ${esc(sellerLegalName)}` : "",
+      sellerTaxId ? `GSTIN ${esc(sellerTaxId)}` : "",
+      buyerTaxId ? `Billed to GSTIN ${esc(buyerTaxId)}` : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
 
     const html = `
       <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 600px; margin: 0 auto; background-color: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; overflow: hidden;">
@@ -326,8 +369,9 @@ class EmailService {
         </div>
         <div style="padding: 32px; color: #334155;">
           <p style="margin: 0 0 16px; font-size: 14px; line-height: 1.6;">
-            Thank you for subscribing, <strong>${tenantName}</strong>!<br/>
-            Your workspace subscription has been successfully processed and renewed.
+            ${params.isRenewal ? "Your subscription has renewed" : "Thank you for subscribing"}, <strong>${tenantName}</strong>!<br/>
+            ${params.isRenewal ? "Your automatic renewal payment was successful." : "Your payment was received and your plan is active."}
+            ${params.pdf ? "Your invoice is attached to this email as a PDF." : "You can download your invoice as a PDF from Settings, Usage and Plans."}
           </p>
           <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 20px; margin-bottom: 24px;">
             <table style="width: 100%; font-size: 13px; border-collapse: collapse;">
@@ -335,9 +379,10 @@ class EmailService {
                 <td style="padding: 8px 0; color: #64748b;">Plan Tier:</td>
                 <td style="padding: 8px 0; font-weight: 700; color: #0f172a; text-align: right;">${planName}</td>
               </tr>
+              ${taxRows}
               <tr style="border-bottom: 1px solid #e2e8f0;">
                 <td style="padding: 8px 0; color: #64748b;">Amount Paid:</td>
-                <td style="padding: 8px 0; font-weight: 700; color: #059669; text-align: right; font-size: 15px;">${currency} ${amount.toFixed(2)}</td>
+                <td style="padding: 8px 0; font-weight: 700; color: #059669; text-align: right; font-size: 15px;">${money(amount)}</td>
               </tr>
               <tr style="border-bottom: 1px solid #e2e8f0;">
                 <td style="padding: 8px 0; color: #64748b;">Billing Cycle:</td>
@@ -356,6 +401,7 @@ class EmailService {
           <p style="margin: 0; font-size: 13px; color: #64748b; line-height: 1.5;">
             Your full quota limits (channels, contacts, messages, AI copilot queries) are unlocked for this period.
           </p>
+          ${sellerLines ? `<p style="margin: 12px 0 0; font-size: 11px; color: #94a3b8;">${sellerLines}</p>` : ""}
         </div>
         <div style="background-color: #f8fafc; border-top: 1px solid #e2e8f0; padding: 16px 32px; text-align: center; font-size: 12px; color: #94a3b8;">
           © ${new Date().getFullYear()} Omni Platform SaaS. All rights reserved.
@@ -363,11 +409,117 @@ class EmailService {
       </div>
     `;
 
-    await this.sendEmail({
+    return this.sendEmail({
       to,
       subject: `Payment Receipt: ${planName} Subscription [${invoiceNumber}]`,
       html,
+      bcc: params.bcc,
+      attachments: params.pdf
+        ? [{ filename: params.pdf.fileName, content: params.pdf.content, contentType: "application/pdf" }]
+        : undefined,
     });
+  }
+
+  /** A credit note issued to the workspace owner (a refund, or the credit of an upgrade), with its PDF. */
+  public async sendCreditNote(params: {
+    to: string;
+    tenantName: string;
+    creditNoteNumber: string;
+    invoiceNumber: string;
+    appliedToInvoiceNumber: string | null;
+    total: number;
+    currency: string;
+    reason: string;
+    pdf?: { fileName: string; content: Buffer };
+    bcc?: string;
+  }): Promise<{ success: boolean; simulated: boolean; error?: string }> {
+    const money = `${escapeHtml(params.currency)} ${params.total.toFixed(2)}`;
+    const html = this.billingNoticeHtml(`Credit note ${params.creditNoteNumber}`, [
+      `A credit note of <strong>${money}</strong> was issued to <strong>${escapeHtml(params.tenantName)}</strong> against invoice ${escapeHtml(params.invoiceNumber)}.`,
+      params.appliedToInvoiceNumber
+        ? `It was applied to invoice ${escapeHtml(params.appliedToInvoiceNumber)}, so no separate payment or refund is due for this amount.`
+        : "Any refund is paid back through your original payment method.",
+      `Reason: ${escapeHtml(params.reason)}`,
+      params.pdf ? "The credit note is attached to this email as a PDF." : "You can download it as a PDF from Settings, Usage and Plans.",
+    ]);
+    return this.sendEmail({
+      to: params.to,
+      subject: `Credit note ${params.creditNoteNumber} (against ${params.invoiceNumber})`,
+      html,
+      bcc: params.bcc,
+      attachments: params.pdf
+        ? [{ filename: params.pdf.fileName, content: params.pdf.content, contentType: "application/pdf" }]
+        : undefined,
+    });
+  }
+
+  /** Shared frame for the short billing notices below. */
+  private billingNoticeHtml(title: string, lines: string[]): string {
+    return `
+      <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 560px; margin: 0 auto; border: 1px solid #e2e8f0; border-radius: 12px; overflow: hidden;">
+        <div style="background: #0f172a; padding: 20px 28px; color: #ffffff;">
+          <h1 style="margin: 0; font-size: 18px; font-weight: 700;">${escapeHtml(title)}</h1>
+        </div>
+        <div style="padding: 24px 28px; color: #334155; font-size: 14px; line-height: 1.6;">
+          ${lines.map((line) => `<p style="margin: 0 0 12px;">${line}</p>`).join("")}
+        </div>
+      </div>`;
+  }
+
+  /** The automatic renewal charge failed. The provider retries; access continues until the paid period ends. */
+  public async sendSubscriptionPaymentFailed(params: {
+    to: string;
+    tenantName: string;
+    planName: string;
+    amount: number;
+    currency: string;
+    gateway: string;
+    keepsAccessUntil: string | null;
+  }): Promise<void> {
+    const { to, amount, currency, gateway, keepsAccessUntil } = params;
+    const tenantName = escapeHtml(params.tenantName);
+    const planName = escapeHtml(params.planName);
+    const until = keepsAccessUntil ? new Date(keepsAccessUntil).toLocaleDateString() : null;
+    const html = this.billingNoticeHtml("We couldn't renew your subscription", [
+      `Hi <strong>${tenantName}</strong>,`,
+      `The automatic renewal of your <strong>${planName}</strong> plan (${escapeHtml(currency)} ${amount.toFixed(2)}) did not go through.`,
+      gateway === "stripe"
+        ? "Please update your card from Settings → Usage &amp; Plans → Manage card. We'll try the payment again."
+        : "Please check your UPI / bank mandate and make sure the balance is available. The payment will be tried again.",
+      until
+        ? `Your plan stays active until <strong>${until}</strong>. If the payment still fails after that, the workspace moves to the Free plan.`
+        : "If the payment keeps failing, the workspace will move to the Free plan.",
+    ]);
+    await this.sendEmail({ to, subject: `Action needed: your ${params.planName} renewal failed`, html });
+  }
+
+  /** A prepaid plan (no automatic renewal) is about to run out. */
+  public async sendPlanExpiringSoon(params: {
+    to: string;
+    tenantName: string;
+    planName: string;
+    expiresAt: string;
+  }): Promise<void> {
+    const tenantName = escapeHtml(params.tenantName);
+    const planName = escapeHtml(params.planName);
+    const html = this.billingNoticeHtml("Your plan ends soon", [
+      `Hi <strong>${tenantName}</strong>,`,
+      `Your <strong>${planName}</strong> plan ends on <strong>${new Date(params.expiresAt).toLocaleDateString()}</strong>.`,
+      "Renew it from Settings → Usage &amp; Plans to keep your limits and features. You can turn on automatic renewal there so this does not happen again.",
+    ]);
+    await this.sendEmail({ to: params.to, subject: `Your ${params.planName} plan ends soon`, html });
+  }
+
+  /** The plan ran out (after the grace period) and the workspace was moved to the Free plan. */
+  public async sendPlanExpired(params: { to: string; tenantName: string; planName: string }): Promise<void> {
+    const tenantName = escapeHtml(params.tenantName);
+    const planName = escapeHtml(params.planName);
+    const html = this.billingNoticeHtml("Your plan has ended", [
+      `Hi <strong>${tenantName}</strong>,`,
+      `Your <strong>${planName}</strong> plan ended and the workspace is now on the Free plan. Your data is safe.`,
+      "You can upgrade again any time from Settings → Usage &amp; Plans.",
+    ]);
+    await this.sendEmail({ to: params.to, subject: `Your ${params.planName} plan has ended`, html });
   }
 
   public async sendPasswordResetEmail(params: {

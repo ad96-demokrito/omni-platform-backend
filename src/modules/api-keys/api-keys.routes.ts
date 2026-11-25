@@ -1,11 +1,13 @@
 import { Router, Response } from "express";
 import { requireAuth, requireRole, AuthedRequest } from "../../middleware/auth";
+import { requireFeature } from "../billing/plan-limits.service";
 import { ApiKeysService } from "./api-keys.service";
 import { asyncHandler } from "../../middleware/async-handler";
 
 export const apiKeysRouter = Router();
 
 apiKeysRouter.use(requireAuth);
+apiKeysRouter.use(requireFeature("api_keys"));
 
 /**
  * GET /api/api-keys

@@ -1,6 +1,7 @@
 import { query, queryOne } from "../../db/pool";
 import { indexContact, removeContactsFromIndex } from "../search/search.service";
 import { logger } from "../../utils/logger";
+import { assertWithinLimit, recordUsage } from "../billing/plan-limits.service";
 import * as XLSX from "xlsx";
 
 const log = logger.child({ module: "contacts-service" });
@@ -277,6 +278,13 @@ export async function createContact(params: {
 
   const normalizedExternalId = normalizePhoneNumber(externalId, countryCode);
 
+  // This call updates a contact that already exists, so only a brand-new contact counts against the plan.
+  const alreadyExists = await queryOne<{ id: string }>(
+    "SELECT id FROM contacts WHERE tenant_id = $1 AND channel_id = $2 AND external_id = $3",
+    [tenantId, channelId, normalizedExternalId]
+  );
+  if (!alreadyExists) await assertWithinLimit(tenantId, "contacts");
+
   const mergedAttributes = {
     ...attributes,
     ...(email ? { email: email.trim() } : {}),
@@ -295,6 +303,7 @@ export async function createContact(params: {
   );
 
   if (!contact) throw new Error("Failed to create contact");
+  if (!alreadyExists) await recordUsage(tenantId, "contacts");
 
   syncContactIndex(contact);
 
@@ -578,6 +587,9 @@ export async function importContactsFromRows(
     updated: 0,
     errors: [],
   };
+  // Set once the plan's contact limit is reached: the rest of the file only updates contacts that already exist.
+  let planLimitMessage: string | null = null;
+  let skippedForPlanLimit = 0;
 
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
@@ -640,12 +652,26 @@ export async function importContactsFromRows(
         if (updated) syncContactIndex(updated);
         result.updated++;
       } else {
+        // Existing contacts above are still updated once the plan is full; only NEW contacts are held back.
+        if (planLimitMessage) {
+          skippedForPlanLimit++;
+          continue;
+        }
+        try {
+          await assertWithinLimit(tenantId, "contacts");
+        } catch (limitErr) {
+          if ((limitErr as { code?: string }).code !== "PLAN_LIMIT_REACHED") throw limitErr;
+          planLimitMessage = (limitErr as Error).message;
+          skippedForPlanLimit++;
+          continue;
+        }
         const created = await queryOne<Contact>(
           `INSERT INTO contacts (tenant_id, channel_id, external_id, name, attributes)
            VALUES ($1, $2, $3, $4, $5) RETURNING *`,
           [tenantId, channelId, normalizedExternalId, row.name?.trim() || null, initialAttributes]
         );
         if (created) {
+          await recordUsage(tenantId, "contacts");
           syncContactIndex(created);
           result.imported++;
         }
@@ -653,6 +679,10 @@ export async function importContactsFromRows(
     } catch (err: any) {
       result.errors.push(`Row ${i + 1} (${rawExternalId}): ${err?.message || "Insert failed"}`);
     }
+  }
+
+  if (skippedForPlanLimit > 0) {
+    result.errors.push(`${skippedForPlanLimit} new contacts were not imported. ${planLimitMessage}`);
   }
 
   return result;

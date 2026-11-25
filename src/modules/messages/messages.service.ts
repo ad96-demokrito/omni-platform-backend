@@ -25,6 +25,7 @@ import { isUuid } from "../../utils/http-error";
 import { indexMessage } from "../search/search.service";
 import { emitRealtimeEvent } from "../realtime/websocket.service";
 import { dispatchWebhookEvent } from "../webhooks/outgoing-webhooks.service";
+import { assertWithinLimit, recordUsage } from "../billing/plan-limits.service";
 
 /**
  * Messages live in MongoDB, not Postgres — per architecture doc §3, chat
@@ -206,6 +207,7 @@ export async function recordInboundMessage(params: {
     providerMessageId,
   };
   await collection.insertOne(doc);
+  await recordUsage(tenantId, "messages");
   await touchLastInboundAt(conversationId, sentAt);
   // A new (non-duplicate) customer message reopens a closed case; the message is already saved,
   // so a failure here must not lose it.
@@ -270,6 +272,9 @@ export async function sendOutboundMessage(params: {
     carouselCards,
   } = params;
   let { mediaUrl, mediaStorageKey } = params;
+
+  // Monthly message limit of the plan (outbound only: customers' own messages are never refused).
+  await assertWithinLimit(tenantId, "messages");
 
   // The key comes from the client; it must point at one of this tenant's own files.
   if (mediaStorageKey && !(isSafeMediaKey(mediaStorageKey) && tenantOwnsKey(tenantId, mediaStorageKey))) {
@@ -417,6 +422,7 @@ export async function sendOutboundMessage(params: {
   emitRealtimeEvent(tenantId, "message:new", message, { conversationId }).catch((err) => {
     console.error("[messages] Realtime event emit failed (non-fatal):", err);
   });
+  await recordUsage(tenantId, "messages");
   dispatchWebhookEvent(tenantId, "message.sent", message).catch((err) => {
     console.error("[messages] Webhook dispatch failed (non-fatal):", err);
   });

@@ -5,10 +5,9 @@ import {
   createPaymentTransaction,
   createRazorpayPaymentLink,
   createStripePaymentLink,
-  handleRazorpayWebhook,
-  handleStripeWebhook,
   listPaymentTransactions,
 } from "./payments.service";
+import { handleRazorpayWebhookRequest, handleStripeWebhookRequest } from "../billing/payment-webhooks";
 
 export const paymentsRouter = Router();
 
@@ -115,11 +114,16 @@ export const paymentWebhooksRouter = Router();
 paymentWebhooksRouter.post(
   "/razorpay",
   asyncHandler(async (req, res) => {
-    const signature = req.headers["x-razorpay-signature"] as string | undefined;
-    const rawBody = (req as any).rawBody || JSON.stringify(req.body);
+    const rawBody: Buffer | undefined = (req as any).rawBody;
+    if (!rawBody) return res.status(400).json({ error: "Missing request body" });
 
-    const result = await handleRazorpayWebhook(rawBody, signature, req.body);
-    res.json(result);
+    const result = await handleRazorpayWebhookRequest(
+      rawBody,
+      req.headers["x-razorpay-signature"] as string | undefined,
+      req.headers["x-razorpay-event-id"] as string | undefined,
+      req.body
+    );
+    res.status(result.status).json(result.json);
   })
 );
 
@@ -127,7 +131,14 @@ paymentWebhooksRouter.post(
 paymentWebhooksRouter.post(
   "/stripe",
   asyncHandler(async (req, res) => {
-    const result = await handleStripeWebhook(req.body);
-    res.json(result);
+    const rawBody: Buffer | undefined = (req as any).rawBody;
+    if (!rawBody) return res.status(400).json({ error: "Missing request body" });
+
+    const result = await handleStripeWebhookRequest(
+      rawBody,
+      req.headers["stripe-signature"] as string | undefined,
+      req.body
+    );
+    res.status(result.status).json(result.json);
   })
 );

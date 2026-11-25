@@ -14,6 +14,11 @@
       "value": ""
     },
     {
+      "key": "platformToken",
+      "value": "",
+      "description": "Token from POST /api/platform/auth/login (platform staff, not a workspace user)"
+    },
+    {
       "key": "tenantId",
       "value": ""
     },
@@ -2475,6 +2480,913 @@
               "query": [{ "key": "limit", "value": "50" }]
             }
           }
+        }
+      ]
+    },
+    {
+      "name": "18. Billing (plans, currency, tax, checkout, subscriptions)",
+      "description": "Plans are priced in the workspace's billing currency (India = INR via Razorpay + 18% GST, everywhere else = USD via Stripe). A paid plan only activates once the payment provider confirms the payment. A plan can renew automatically (autoRenew). See plan/017. Plan limits and gated features (PLAN_ENFORCEMENT=off|warn|enforce): when enforced, a request the plan does not allow answers HTTP 402 with code PLAN_LIMIT_REACHED (metric, limit, used) or FEATURE_NOT_IN_PLAN (feature). Invoices are GST tax invoices with a stored PDF (plan/018); PUT /api/billing/profile also takes stateCode (GST state, required to pay in INR).",
+      "item": [
+        {
+          "name": "Get Usage & Plans",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/billing/usage",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "billing",
+                "usage"
+              ]
+            },
+            "description": "Usage vs limits, billingCountry/billingCurrency/currencyLocked, tax {ratePercent,label}, and availablePlans priced in the workspace's currency (priceAvailable=false means no price in that currency)."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.code === 200);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get Billing Profile",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/billing/profile",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "billing",
+                "profile"
+              ]
+            },
+            "description": "Billing country, currency, GSTIN, name and address (owner/admin)."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.code === 200);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Update Billing Profile",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/billing/profile",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "billing",
+                "profile"
+              ]
+            },
+            "description": "country (ISO-2) decides the currency: IN -> INR, otherwise USD. Refused with 409 once the currency is locked by the first paid payment. taxId is validated as a GSTIN for India.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"country\": \"IN\",\n  \"taxId\": \"22AAAAA0000A1Z5\",\n  \"name\": \"Acme Pvt Ltd\",\n  \"address\": {\n    \"line1\": \"1 MG Road\",\n    \"city\": \"Pune\",\n    \"state\": \"MH\",\n    \"postalCode\": \"411001\"\n  }\n}"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.code === 200);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Start Checkout (buy a plan)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/billing/checkout",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "billing",
+                "checkout"
+              ]
+            },
+            "description": "The server decides the price (workspace currency + GST for India) and the gateway (INR -> Razorpay, otherwise Stripe); the body only picks the plan, the cycle and whether it renews automatically (autoRenew: true = a subscription, charged every cycle until cancelled). Paid plans return checkoutUrl and a pending checkout: the plan does NOT change until the payment is confirmed. A free plan activates immediately (isFree + activated). Returns subtotal/taxAmount/taxRate/amount/autoRenew. 400 if the plan has no price in your currency, 409 if an auto-renewing plan is already live (cancel it first), 502/503 if the payment provider is unavailable.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"planId\": \"starter\",\n  \"billingCycle\": \"monthly\",\n  \"autoRenew\": true\n}"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.code === 200);",
+                  "pm.collectionVariables.set('checkoutSessionId', pm.response.json().sessionId);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Checkout Status",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/billing/checkout/{{checkoutSessionId}}/status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "billing",
+                "checkout",
+                "{{checkoutSessionId}}",
+                "status"
+              ]
+            },
+            "description": "Asks the payment provider whether the checkout was paid and activates the plan (idempotent, same path the webhook uses). status: pending | paid | failed | expired. Another workspace's checkout is a 404. sessionId is the provider session/subscription id (cs_... / plink_... / sub_...) or the checkout id."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.code === 200);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get Subscription",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/billing/subscription",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "billing",
+                "subscription"
+              ]
+            },
+            "description": "The workspace's auto-renewing subscription: status (active | past_due), price per renewal, next renewal date (currentPeriodEnd), cancelAtPeriodEnd, canManageCard. { subscription: null } when it has none."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.code === 200);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Cancel Renewal",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/billing/subscription/cancel",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "billing",
+                "subscription",
+                "cancel"
+              ]
+            },
+            "description": "Stops renewals at the provider (Razorpay cancel_at_cycle_end / Stripe cancel_at_period_end). The plan stays active until the period already paid for ends. Idempotent. 404 if there is no live subscription, 502 if the provider call fails (nothing changes locally).",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.code === 200);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Card Portal (Stripe)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/billing/subscription/portal",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "billing",
+                "subscription",
+                "portal"
+              ]
+            },
+            "description": "URL of Stripe's hosted page for changing the card. 400 for workspaces that do not pay by card.",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.code === 200);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Sandbox: Simulate Renewal",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/billing/subscription/sandbox/renew",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "billing",
+                "subscription",
+                "sandbox",
+                "renew"
+              ]
+            },
+            "description": "DEVELOPMENT ONLY (BILLING_SANDBOX=true): records the next automatic renewal of a sandbox subscription. 404 otherwise.",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.code === 200);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Sandbox: Simulate Failed Renewal",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/billing/subscription/sandbox/fail",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "billing",
+                "subscription",
+                "sandbox",
+                "fail"
+              ]
+            },
+            "description": "DEVELOPMENT ONLY (BILLING_SANDBOX=true): marks a sandbox subscription past_due and sends the failed-renewal email. 404 otherwise.",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.code === 200);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Switch to a Free Plan",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/billing/plan",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "billing",
+                "plan"
+              ]
+            },
+            "description": "Only a FREE plan can be selected this way; any paid plan returns 403 (buy it through checkout).",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"planId\": \"free\"\n}"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.code === 200);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Platform: Enforcement Report",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{platformToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/platform/plans/enforcement-report",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "platform",
+                "plans",
+                "enforcement-report"
+              ]
+            },
+            "description": "Super admin only. The current PLAN_ENFORCEMENT mode and, for this month, how many requests per workspace and reason were (warn) or would be blocked. Read it in warn mode before switching to enforce."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.code === 200);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Download Invoice PDF",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/billing/invoices/{{invoiceId}}/pdf",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "billing",
+                "invoices",
+                "{{invoiceId}}",
+                "pdf"
+              ]
+            },
+            "description": "The tax invoice as a PDF (owner/admin). Another workspace's invoice, a malformed id and a free-plan record all answer 404."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.code === 200);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Platform: Download Invoice PDF",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{platformToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/platform/payments/{{invoiceId}}/invoice.pdf",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "platform",
+                "payments",
+                "{{invoiceId}}",
+                "invoice.pdf"
+              ]
+            },
+            "description": "Platform staff (super_admin, support_agent). The same stored PDF."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.code === 200);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Platform: Resend Invoice Email",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{platformToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/platform/payments/{{invoiceId}}/resend-invoice",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "platform",
+                "payments",
+                "{{invoiceId}}",
+                "resend-invoice"
+              ]
+            },
+            "description": "Emails the invoice to the workspace owner again. Returns { outcome: sent | failed | disabled | no_recipient | not_configured }. Honours INVOICE_EMAIL_ENABLED / INVOICE_PDF_ATTACH. Audited."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.code === 200);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Platform: Monthly GST Package",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{platformToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/platform/payments/export?month=2026-11&format=zip",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "platform",
+                "payments",
+                "export"
+              ],
+              "query": [
+                {
+                  "key": "month",
+                  "value": "2026-11"
+                },
+                {
+                  "key": "format",
+                  "value": "zip"
+                }
+              ]
+            },
+            "description": "super_admin or finance. A ZIP with the GST register, tax summary, gateway reconciliation and every invoice PDF of the month (India time). format=csv returns only the register. Rate limited (10 per 10 minutes) and audited."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.code === 200);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Upgrade Quote",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/billing/upgrade-quote?planId=pro&billingCycle=monthly",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "billing",
+                "upgrade-quote"
+              ],
+              "query": [
+                {
+                  "key": "planId",
+                  "value": "pro"
+                },
+                {
+                  "key": "billingCycle",
+                  "value": "monthly"
+                }
+              ]
+            },
+            "description": "Preview of an upgrade: the new plan with GST (invoiceTotal), the credit for the unused time of the current plan (credit), what is payable now, or blocked (lower plan, or the credit is worth about the new price)."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 2xx', () => pm.response.code >= 200 && pm.response.code < 300);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List Credit Notes",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/billing/credit-notes",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "billing",
+                "credit-notes"
+              ]
+            },
+            "description": "The workspace's credit notes (refunds and upgrade credits)."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 2xx', () => pm.response.code >= 200 && pm.response.code < 300);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Download Credit Note PDF",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/billing/credit-notes/{{creditNoteId}}/pdf",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "billing",
+                "credit-notes",
+                "{{creditNoteId}}",
+                "pdf"
+              ]
+            },
+            "description": "Another workspace's credit note answers 404."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 2xx', () => pm.response.code >= 200 && pm.response.code < 300);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Platform: List Credit Notes",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{platformToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/platform/payments/credit-notes",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "platform",
+                "payments",
+                "credit-notes"
+              ]
+            },
+            "description": "Any platform role that may read payments (incl. finance). Optional month=YYYY-MM (India time) and tenantId."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 2xx', () => pm.response.code >= 200 && pm.response.code < 300);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Platform: Credit Note PDF",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{platformToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/platform/payments/credit-notes/{{creditNoteId}}/pdf",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "platform",
+                "payments",
+                "credit-notes",
+                "{{creditNoteId}}",
+                "pdf"
+              ]
+            },
+            "description": "super_admin, support_agent, finance."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 2xx', () => pm.response.code >= 200 && pm.response.code < 300);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Platform: Issue Credit Note",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{platformToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/platform/payments/{{invoiceId}}/credit-notes",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "platform",
+                "payments",
+                "{{invoiceId}}",
+                "credit-notes"
+              ]
+            },
+            "description": "Super admin only. kind = refund | cancellation | correction; total (tax included) optional: leave out to credit what is left. Credit notes of one invoice never exceed it (409). Moves no money: refund in the gateway dashboard. Audited.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"kind\": \"refund\",\n  \"reason\": \"Customer asked for a refund\",\n  \"total\": 500\n}"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 2xx', () => pm.response.code >= 200 && pm.response.code < 300);"
+                ]
+              }
+            }
+          ]
         }
       ]
     }

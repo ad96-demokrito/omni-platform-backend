@@ -1,6 +1,7 @@
 import { NextFunction, Response, Router } from "express";
 import multer from "multer";
 import { AuthedRequest, requireAuth } from "../../middleware/auth";
+import { requireFeature } from "../billing/plan-limits.service";
 import { asyncHandler } from "../../middleware/async-handler";
 import { KnowledgeBaseService } from "./knowledge-base.service";
 import { MAX_DOCUMENT_UPLOAD_BYTES, extractDocumentText } from "./document-extract";
@@ -27,6 +28,7 @@ function receiveDocumentFile(req: AuthedRequest, res: Response, next: NextFuncti
 
 export const knowledgeBaseRouter = Router();
 knowledgeBaseRouter.use(requireAuth);
+knowledgeBaseRouter.use(requireFeature("ai_copilot"));
 
 // GET /api/knowledge-bases - List all knowledge bases for tenant
 knowledgeBaseRouter.get(

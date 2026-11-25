@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from "express";
 import { verifyToken } from "../modules/auth/auth.service";
 import { ApiKeysService } from "../modules/api-keys/api-keys.service";
 import { queryOne } from "../db/pool";
+import { apiKeyFeatureBlock, suspendedWorkspaceBlock } from "../modules/billing/plan-limits.service";
 
 export interface AuthedRequest extends Request {
   auth?: {
@@ -50,10 +51,15 @@ export async function requireAuth(req: AuthedRequest, res: Response, next: NextF
         apiKeyId: apiKey.id,
         scopes: apiKey.scopes,
       };
-      return next();
     } catch (err) {
       return res.status(401).json({ error: "Failed to authenticate API key" });
     }
+
+    // The plan decides whether API keys work at all, and a suspended workspace can only read.
+    const keyBlocked =
+      (await apiKeyFeatureBlock(req.auth!.tenantId)) ??
+      (await suspendedWorkspaceBlock(req.auth!.tenantId, req.method, req.baseUrl));
+    return keyBlocked ? next(keyBlocked) : next();
   }
 
   // 2. Validate standard JWT token
@@ -89,10 +95,13 @@ export async function requireAuth(req: AuthedRequest, res: Response, next: NextF
       tenantId: user.tenant_id,
       role: user.role,
     };
-    next();
   } catch (err) {
-    res.status(401).json({ error: "Invalid or expired token" });
+    return res.status(401).json({ error: "Invalid or expired token" });
   }
+
+  // A suspended workspace can read but not change anything (billing, sign-in and support stay open).
+  const blocked = await suspendedWorkspaceBlock(req.auth!.tenantId, req.method, req.baseUrl);
+  return blocked ? next(blocked) : next();
 }
 
 type AuthUserRow = {

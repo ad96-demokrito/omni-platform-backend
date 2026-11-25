@@ -60,8 +60,15 @@ import { runFlowForConversation } from "./modules/flows/flow-engine-runner";
 import { initFlowDelayWorker, initHandoffTimeoutWorker } from "./modules/jobs/queue.service";
 import { resumeBotAfterHandoffTimeout } from "./modules/conversations/conversations.service";
 import { sendOutboundMessage } from "./modules/messages/messages.service";
+import { assertBillingConfig } from "./modules/billing/config";
+import { planLifecycleMode, processPlanLifecycle } from "./modules/billing/plan-lifecycle.service";
+import { retryInvoiceEmails } from "./modules/billing/invoice-delivery.service";
+import { retrySupersededCancellations } from "./modules/billing/subscription.service";
 
 dotenv.config();
+
+// A payment gateway without its webhook secret (or the app URL) must stop a production boot.
+assertBillingConfig();
 
 const app = express();
 
@@ -243,6 +250,56 @@ setInterval(async () => {
     dripPassRunning = false;
   }
 }, DRIP_POLL_INTERVAL_MS);
+
+/**
+ * Invoice emails that failed (or never finished) are tried again every hour, a few times each (plan/018).
+ * Does nothing while INVOICE_EMAIL_ENABLED is off.
+ */
+const INVOICE_EMAIL_RETRY_INTERVAL_MS = 60 * 60 * 1000;
+const invoiceRetryLog = logger.child({ module: "invoice-email-retry" });
+let invoiceRetryRunning = false;
+setInterval(async () => {
+  if (invoiceRetryRunning) return;
+  invoiceRetryRunning = true;
+  try {
+    await retryInvoiceEmails();
+    await retrySupersededCancellations();
+  } catch (err) {
+    invoiceRetryLog.error("invoice email retry pass failed", err);
+  } finally {
+    invoiceRetryRunning = false;
+  }
+}, INVOICE_EMAIL_RETRY_INTERVAL_MS);
+
+/**
+ * Plan lifecycle: moves workspaces whose paid period (plus grace) ended to the Free plan and sends reminders for
+ * prepaid plans that end soon. PLAN_LIFECYCLE_MODE=warn (the default) only logs what it would do, off disables it.
+ */
+const PLAN_LIFECYCLE_INTERVAL_MS = Number(process.env.PLAN_LIFECYCLE_INTERVAL_MS) || 60 * 60 * 1000;
+const planLifecycleLog = logger.child({ module: "plan-lifecycle" });
+if (planLifecycleMode() !== "off") {
+  let lifecyclePassRunning = false;
+  const runPlanLifecycle = async () => {
+    if (lifecyclePassRunning) return;
+    lifecyclePassRunning = true;
+    try {
+      const result = await processPlanLifecycle();
+      if (result.downgraded || result.wouldDowngrade || result.remindersSent || result.wouldRemind) {
+        planLifecycleLog.info(
+          `mode=${result.mode} downgraded=${result.downgraded} wouldDowngrade=${result.wouldDowngrade} ` +
+            `remindersSent=${result.remindersSent} wouldRemind=${result.wouldRemind}`
+        );
+      }
+    } catch (err) {
+      planLifecycleLog.error("plan lifecycle pass failed", err);
+    } finally {
+      lifecyclePassRunning = false;
+    }
+  };
+  planLifecycleLog.info(`plan lifecycle mode=${planLifecycleMode()}, every ${PLAN_LIFECYCLE_INTERVAL_MS}ms`);
+  setTimeout(runPlanLifecycle, 60_000); // first pass shortly after boot
+  setInterval(runPlanLifecycle, PLAN_LIFECYCLE_INTERVAL_MS);
+}
 
 /**
  * Initialize BullMQ Flow Delay Worker for Wait nodes & automated retry loops

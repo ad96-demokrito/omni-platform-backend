@@ -4,6 +4,7 @@ import crypto from "crypto";
 import { queryOne, withTransaction } from "../../db/pool";
 import { emailService } from "../email/email.service";
 import { logger } from "../../utils/logger";
+import { currencyForCountry } from "../billing/currency";
 
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "7d";
@@ -39,6 +40,8 @@ export async function signup(params: {
   tenantName: string;
   email: string;
   password: string;
+  /** ISO country code; decides the billing currency (IN -> INR, otherwise USD). */
+  country?: string | null;
 }): Promise<{
   token: string;
   tenantId: string;
@@ -46,7 +49,8 @@ export async function signup(params: {
   role: string;
   email: string;
 }> {
-  const { tenantName, email, password } = params;
+  const { tenantName, email, password, country } = params;
+  const billingCountry = country ?? null;
 
   const existing = await queryOne(
     "SELECT id FROM users WHERE lower(email) = lower($1)",
@@ -60,10 +64,21 @@ export async function signup(params: {
 
   const { tenantId, userId } = await withTransaction(async (client) => {
     const tenantResult = await client.query(
-      "INSERT INTO tenants (name) VALUES ($1) RETURNING id",
-      [tenantName],
+      "INSERT INTO tenants (name, billing_country, billing_currency) VALUES ($1, $2, $3) RETURNING id",
+      [tenantName, billingCountry, currencyForCountry(billingCountry)],
     );
     const tenantId = tenantResult.rows[0].id as string;
+
+    // A new workspace starts with the Free plan's advertised limits. (The column defaults are older, much
+    // larger numbers; without this a "Free" workspace would be allowed far more than the plan page says.)
+    await client.query(
+      `UPDATE tenants t
+       SET max_channels = p.max_channels, max_contacts = p.max_contacts,
+           max_monthly_messages = p.max_monthly_messages, max_monthly_ai_queries = p.max_monthly_ai_queries
+       FROM platform_plans p
+       WHERE t.id = $1 AND p.id = 'free'`,
+      [tenantId]
+    );
 
     const userResult = await client.query(
       `INSERT INTO users (tenant_id, email, password_hash, role, status)

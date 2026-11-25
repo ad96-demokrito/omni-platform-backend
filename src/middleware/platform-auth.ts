@@ -2,6 +2,21 @@ import { Request, Response, NextFunction } from "express";
 import { verifyPlatformToken, PlatformRole, PlatformTokenPayload } from "../modules/platform-auth/platform-auth.service";
 import { queryOne, query } from "../db/pool";
 
+/**
+ * A `finance` login (the accountant) is read-only and sees money documents only: the payments ledger, invoice
+ * PDFs and the monthly GST package. Everything else answers 403, whatever role guard a route has or lacks, so a
+ * route added later without a guard cannot leak to this role.
+ */
+const FINANCE_ALLOWED: ReadonlyArray<{ method: string; basePath: string }> = [
+  { method: "GET", basePath: "/api/platform/payments" },
+  { method: "GET", basePath: "/api/platform/auth" },
+  { method: "PUT", basePath: "/api/platform/auth" }, // own profile / password
+];
+
+export function financeMayAccess(method: string, baseUrl: string): boolean {
+  return FINANCE_ALLOWED.some((rule) => rule.method === method.toUpperCase() && baseUrl === rule.basePath);
+}
+
 export interface PlatformAuthedRequest extends Request {
   platformUser?: {
     id: string;
@@ -64,6 +79,10 @@ export async function requirePlatformAuth(req: PlatformAuthedRequest, res: Respo
       role: staff.role,
       permissions: Array.isArray(staff.permissions) ? staff.permissions : [],
     };
+
+    if (staff.role === "finance" && !financeMayAccess(req.method, req.baseUrl)) {
+      return res.status(403).json({ error: "Finance accounts can only view payments and download invoices." });
+    }
 
     next();
   } catch (err: any) {

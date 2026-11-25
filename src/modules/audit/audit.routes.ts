@@ -1,11 +1,13 @@
 import { Router, Response } from "express";
 import { requireAuth, requireRole, AuthedRequest } from "../../middleware/auth";
+import { requireFeature } from "../billing/plan-limits.service";
 import { AuditService } from "./audit.service";
 import { asyncHandler } from "../../middleware/async-handler";
 
 export const auditRouter = Router();
 
 auditRouter.use(requireAuth);
+auditRouter.use(requireFeature("audit_compliance"));
 
 /**
  * GET /api/audit-logs

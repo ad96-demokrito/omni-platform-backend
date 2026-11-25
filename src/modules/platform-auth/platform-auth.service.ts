@@ -5,7 +5,7 @@ import { queryOne, query } from "../../db/pool";
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
 const JWT_EXPIRES_IN = process.env.PLATFORM_JWT_EXPIRES_IN || "1d"; // Shorter 24h expiry for high-privilege staff
 
-export type PlatformRole = "super_admin" | "platform_dev" | "platform_tester" | "support_agent";
+export type PlatformRole = "super_admin" | "platform_dev" | "platform_tester" | "support_agent" | "finance";
 
 export interface PlatformTokenPayload {
   platformUserId: string;
@@ -88,7 +88,7 @@ export async function loginPlatformStaff(params: {
   // Log to platform audit trail
   await query(
     `INSERT INTO platform_audit_logs (platform_user_id, platform_user_email, platform_user_role, action, target_type, target_id, details, ip_address, user_agent)
-     VALUES ($1, $2, $3, 'staff.login', 'platform_user', $1, '{"status": "success"}'::jsonb, $4, $5)`,
+     VALUES ($1::uuid, $2, $3, 'staff.login', 'platform_user', $1::text, '{"status": "success"}'::jsonb, $4, $5)`,
     [staff.id, staff.email, staff.role, ipAddress || null, userAgent || null]
   ).catch((e) => console.error("Failed to log platform login audit:", e));
 

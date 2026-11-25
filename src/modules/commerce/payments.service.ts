@@ -1,4 +1,3 @@
-import crypto from "crypto";
 import { v4 as uuidv4 } from "uuid";
 import { query, queryOne } from "../../db/pool";
 import { getOrder, setOrderPaymentLink, updateOrderStatus } from "./orders.service";
@@ -314,25 +313,8 @@ export async function createStripePaymentLink(
 /**
  * Reconcile Razorpay Webhook Event
  */
-export async function handleRazorpayWebhook(
-  rawBody: Buffer | string,
-  signature: string | undefined,
-  body: any
-): Promise<{ success: boolean; message: string }> {
-  const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
-
-  if (webhookSecret && signature) {
-    const expectedSignature = crypto
-      .createHmac("sha256", webhookSecret)
-      .update(rawBody)
-      .digest("hex");
-
-    if (expectedSignature !== signature) {
-      logger.warn("Razorpay Webhook signature verification failed");
-      return { success: false, message: "Invalid webhook signature" };
-    }
-  }
-
+export async function handleRazorpayWebhook(body: any): Promise<{ success: boolean; message: string }> {
+  // The signature was already verified (and the event de-duplicated) by billing/payment-webhooks.ts.
   const event = body?.event;
   const payload = body?.payload;
 

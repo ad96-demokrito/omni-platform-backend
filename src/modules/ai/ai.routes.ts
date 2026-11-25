@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { AuthedRequest, requireAuth } from "../../middleware/auth";
+import { requireFeature } from "../billing/plan-limits.service";
 import { asyncHandler } from "../../middleware/async-handler";
 import { CopilotService } from "./copilot.service";
 import { RAGService } from "./rag.service";
@@ -7,6 +8,7 @@ import { query } from "../../db/pool";
 
 export const aiRouter = Router();
 aiRouter.use(requireAuth);
+aiRouter.use(requireFeature("ai_copilot"));
 
 // POST /api/ai/copilot/suggest - Get smart reply suggestions for conversation
 aiRouter.post(

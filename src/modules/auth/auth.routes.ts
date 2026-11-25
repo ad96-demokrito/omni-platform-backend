@@ -13,6 +13,7 @@ import {
 import { requireAuth, AuthedRequest } from "../../middleware/auth";
 import { rateLimitByIp, hitRateLimit } from "../../middleware/rate-limit";
 import { logger } from "../../utils/logger";
+import { normalizeCountryCode } from "../billing/currency";
 
 const PASSWORD_RESET_WINDOW_SECONDS =
   Number(process.env.PASSWORD_RESET_WINDOW_SECONDS) || 15 * 60;
@@ -20,14 +21,19 @@ const PASSWORD_RESET_WINDOW_SECONDS =
 export const authRouter = Router();
 
 authRouter.post("/signup", async (req, res) => {
-  const { tenantName, email, password } = req.body || {};
+  const { tenantName, email, password, country } = req.body || {};
   if (!tenantName || !email || !password) {
     return res
       .status(400)
       .json({ error: "tenantName, email and password are required" });
   }
+  // Optional: the billing country decides the currency prices are shown in.
+  const billingCountry = country === undefined || country === null || country === "" ? null : normalizeCountryCode(country);
+  if (country !== undefined && country !== null && country !== "" && !billingCountry) {
+    return res.status(400).json({ error: "country must be a 2-letter ISO country code (for example IN or US)" });
+  }
   try {
-    const result = await signup({ tenantName, email, password });
+    const result = await signup({ tenantName, email, password, country: billingCountry });
     res.status(201).json(result);
   } catch (err) {
     if (err instanceof AuthError)

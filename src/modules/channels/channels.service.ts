@@ -1,5 +1,6 @@
 import { query, queryOne } from "../../db/pool";
 import { encryptObject, decryptObject } from "../../utils/crypto";
+import { assertWithinLimit } from "../billing/plan-limits.service";
 import {
   getMetaPhoneNumberDetails,
   getMetaWabaDetails,
@@ -83,6 +84,7 @@ export async function createChannel(params: {
   credentials: Record<string, any>;
 }): Promise<Channel> {
   const { tenantId, type, displayName, credentials } = params;
+  await assertWithinLimit(tenantId, "channels");
   const encryptedCredentials = encryptObject(credentials);
 
   const row = await queryOne<Channel>(

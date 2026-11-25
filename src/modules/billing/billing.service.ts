@@ -3,7 +3,37 @@ import { query, queryOne } from "../../db/pool";
 import { getMongoDb } from "../../db/mongo";
 import { AuditService } from "../audit/audit.service";
 import { logger } from "../../utils/logger";
-import { listPlatformPlans, getPlatformPlanById } from "../platform-governance/platform-plans.service";
+import {
+  listPlatformPlans,
+  getPlatformPlanById,
+  PlanPrice,
+  PlatformPlanItem,
+} from "../platform-governance/platform-plans.service";
+import { httpError } from "../../utils/http-error";
+import {
+  BillingCurrency,
+  DEFAULT_BILLING_CURRENCY,
+  currencyForCountry,
+  gatewayForCurrency,
+  isSupportedCurrency,
+  normalizeCountryCode,
+} from "./currency";
+import { sandboxEnabled, sellerDetails } from "./config";
+import { normalizeStateCode, stateCodeFromGstin } from "./gst-states";
+import {
+  ALL_FEATURES_ON,
+  EnforcementMode,
+  FeatureFlags,
+  UNLIMITED,
+  enforcementMode,
+  getEntitlements,
+  invalidateEntitlements,
+} from "./plan-limits.service";
+import { computeTax } from "./gst";
+import { assessUpgrade } from "./proration.service";
+import { CheckoutSessionResult, getCheckoutStatus, startPaidCheckout } from "./checkout.service";
+
+export type { CheckoutSessionResult } from "./checkout.service";
 import {
   recordSubscriptionPayment,
   listSubscriptionPayments,
@@ -16,17 +46,28 @@ export interface PlanConfig {
   id: string;
   name: string;
   description: string;
+  /** Price in `currency` (the viewing workspace's billing currency); 0 when `priceAvailable` is false. */
   priceMonthly: number;
   priceYearly?: number;
   currency?: string;
+  /** False when the plan has no price in the workspace's currency yet: it cannot be bought. */
+  priceAvailable: boolean;
+  /** Every currency this plan is sold in. */
+  prices?: PlanPrice[];
   maxChannels: number;
   maxContacts: number;
   maxMonthlyMessages: number;
   maxMonthlyAiQueries: number;
   features: string[];
+  /** Gated features this plan includes (plan/017 Phase 4). */
+  featureFlags?: FeatureFlags;
   badgeText?: string | null;
 }
 
+/**
+ * Display-only fallback for a database with no plans yet (limits and copy only). Prices live in
+ * platform_plan_prices, so these plans are not purchasable: checkout never uses this table.
+ */
 export const PLAN_TIERS: Record<string, PlanConfig> = {
   free: {
     id: "free",
@@ -34,7 +75,7 @@ export const PLAN_TIERS: Record<string, PlanConfig> = {
     description: "Ideal for testing and single-channel experimentation",
     priceMonthly: 0,
     priceYearly: 0,
-    currency: "USD",
+    priceAvailable: false,
     maxChannels: 1,
     maxContacts: 500,
     maxMonthlyMessages: 2000,
@@ -46,9 +87,9 @@ export const PLAN_TIERS: Record<string, PlanConfig> = {
     id: "starter",
     name: "Starter Growth",
     description: "For small teams scaling messaging and customer service",
-    priceMonthly: 29,
-    priceYearly: 290,
-    currency: "USD",
+    priceMonthly: 0,
+    priceYearly: 0,
+    priceAvailable: false,
     maxChannels: 3,
     maxContacts: 3000,
     maxMonthlyMessages: 15000,
@@ -67,9 +108,9 @@ export const PLAN_TIERS: Record<string, PlanConfig> = {
     id: "pro",
     name: "Pro Scale",
     description: "For fast-growing organizations requiring high capacity & AI agents",
-    priceMonthly: 99,
-    priceYearly: 990,
-    currency: "USD",
+    priceMonthly: 0,
+    priceYearly: 0,
+    priceAvailable: false,
     maxChannels: 10,
     maxContacts: 25000,
     maxMonthlyMessages: 100000,
@@ -89,9 +130,9 @@ export const PLAN_TIERS: Record<string, PlanConfig> = {
     id: "enterprise",
     name: "Enterprise Custom",
     description: "Dedicated infrastructure, SLA guarantees, and limitless capacity",
-    priceMonthly: 299,
-    priceYearly: 2990,
-    currency: "USD",
+    priceMonthly: 0,
+    priceYearly: 0,
+    priceAvailable: false,
     maxChannels: 50,
     maxContacts: 500000,
     maxMonthlyMessages: 1000000,
@@ -123,6 +164,16 @@ export interface WorkspaceUsageSummary {
   planStatus: string;
   planExpiresAt?: string | null;
   billingCycleEnd: string;
+  /** ISO country and the currency prices are shown and charged in. */
+  billingCountry: string | null;
+  billingCurrency: BillingCurrency;
+  /** True after the first paid payment: country/currency changes then need platform staff. */
+  currencyLocked: boolean;
+  /** Tax added on top of plan prices for this workspace (GST for India), so checkout can show it up front. */
+  tax: { ratePercent: number; label: string | null };
+  /** What the current plan includes, and whether limits are enforced (off | warn | enforce). */
+  features: FeatureFlags;
+  enforcement: EnforcementMode;
   metrics: {
     channels: UsageMetric;
     contacts: UsageMetric;
@@ -144,42 +195,205 @@ export interface CreateCheckoutSessionParams {
   actorEmail?: string;
   planId: string;
   billingCycle?: "monthly" | "yearly";
-  gateway?: "stripe" | "razorpay" | "sandbox";
-  successUrl?: string;
-  cancelUrl?: string;
+  /** Renew automatically every cycle until cancelled (a subscription) instead of a single payment. */
+  autoRenew?: boolean;
 }
 
-export interface CheckoutSessionResult {
-  sessionId: string;
-  checkoutUrl?: string;
-  paymentLink?: string;
-  gateway: "stripe" | "razorpay" | "sandbox";
-  planId: string;
-  planName: string;
-  amount: number;
-  currency: string;
-  billingCycle: "monthly" | "yearly";
-  isFree: boolean;
-  isSandbox: boolean;
-  notes?: string;
+export interface BillingProfile {
+  country: string | null;
+  currency: BillingCurrency;
+  taxId: string | null;
+  name: string | null;
+  address: Record<string, string> | null;
+  /** GST state code (place of supply). Required to pay in INR: it decides CGST+SGST or IGST. */
+  stateCode: string | null;
+  currencyLocked: boolean;
 }
 
-export interface VerifyPaymentParams {
-  tenantId: string;
-  actorId?: string;
-  actorEmail?: string;
-  planId: string;
-  billingCycle?: "monthly" | "yearly";
-  gateway?: "stripe" | "razorpay" | "sandbox";
-  paymentReference: string;
-  ipAddress?: string;
+const ADDRESS_FIELDS = ["line1", "line2", "city", "state", "postalCode"] as const;
+const GSTIN_PATTERN = /^\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/;
+
+/** A plan as one workspace sees it: priced in that workspace's currency. */
+function toPlanConfig(plan: PlatformPlanItem, currency: BillingCurrency): PlanConfig {
+  const price = plan.prices.find((p) => p.isActive && p.currency.toUpperCase() === currency);
+  return {
+    id: plan.id,
+    name: plan.name,
+    description: plan.description || "",
+    priceMonthly: price?.priceMonthly ?? 0,
+    priceYearly: price?.priceYearly ?? 0,
+    currency,
+    priceAvailable: Boolean(price),
+    prices: plan.prices,
+    maxChannels: plan.maxChannels,
+    maxContacts: plan.maxContacts,
+    maxMonthlyMessages: plan.maxMonthlyMessages,
+    maxMonthlyAiQueries: plan.maxMonthlyAiQueries,
+    features: plan.features,
+    featureFlags: plan.featureFlags,
+    badgeText: plan.badgeText,
+  };
 }
 
 export class BillingService {
   /**
+   * Billing country, currency and tax details of a workspace. The currency always follows the country
+   * (IN -> INR, everything else USD) unless an older row has none, in which case the country decides.
+   */
+  public static async getBillingProfile(tenantId: string): Promise<BillingProfile> {
+    const row = await queryOne<{
+      billing_country: string | null;
+      billing_currency: string | null;
+      billing_tax_id: string | null;
+      billing_name: string | null;
+      billing_address: Record<string, string> | null;
+      billing_state_code: string | null;
+      currency_locked_at: string | null;
+    }>(
+      `SELECT billing_country, billing_currency, billing_tax_id, billing_name, billing_address,
+              billing_state_code, currency_locked_at
+       FROM tenants WHERE id = $1`,
+      [tenantId]
+    );
+    if (!row) throw httpError(404, "Workspace not found");
+
+    const country = row.billing_country ? row.billing_country.trim().toUpperCase() : null;
+    const storedCurrency = row.billing_currency ? row.billing_currency.trim().toUpperCase() : "";
+    return {
+      country,
+      currency: isSupportedCurrency(storedCurrency) ? storedCurrency : currencyForCountry(country),
+      taxId: row.billing_tax_id,
+      name: row.billing_name,
+      address: row.billing_address,
+      stateCode: row.billing_state_code ? row.billing_state_code.trim() : null,
+      currencyLocked: Boolean(row.currency_locked_at),
+    };
+  }
+
+  /**
+   * Updates billing details. Changing the country can change the currency, so it is refused once the
+   * workspace has paid (the currency is locked); platform staff can still change it on request.
+   */
+  public static async updateBillingProfile(params: {
+    tenantId: string;
+    actorId?: string;
+    actorEmail?: string;
+    country?: unknown;
+    taxId?: unknown;
+    name?: unknown;
+    address?: unknown;
+    stateCode?: unknown;
+    ipAddress?: string;
+  }): Promise<BillingProfile> {
+    const current = await this.getBillingProfile(params.tenantId);
+    const updates: string[] = [];
+    const values: unknown[] = [];
+    const set = (column: string, value: unknown) => {
+      values.push(value);
+      updates.push(`${column} = $${values.length}`);
+    };
+
+    let effectiveCountry = current.country;
+    if (params.country !== undefined) {
+      const country = normalizeCountryCode(params.country);
+      if (!country) throw httpError(400, "country must be a 2-letter ISO country code (for example IN or US)");
+      const newCurrency = currencyForCountry(country);
+      if (current.currencyLocked && newCurrency !== current.currency) {
+        throw httpError(
+          409,
+          "Your billing currency is locked after your first payment. Contact support to change your billing country."
+        );
+      }
+      effectiveCountry = country;
+      set("billing_country", country);
+      set("billing_currency", newCurrency);
+      // A GST state only means something in India.
+      if (country !== "IN") set("billing_state_code", null);
+    }
+
+    if (params.taxId !== undefined) {
+      const taxId = typeof params.taxId === "string" ? params.taxId.trim().toUpperCase() : "";
+      if (taxId.length > 32) throw httpError(400, "Tax ID must be 32 characters or fewer");
+      if (taxId && effectiveCountry === "IN" && !GSTIN_PATTERN.test(taxId)) {
+        throw httpError(400, "Enter a valid 15-character GSTIN (for example 22AAAAA0000A1Z5)");
+      }
+      set("billing_tax_id", taxId || null);
+      // A GSTIN starts with the state code, so it also settles the place of supply (unless a state was sent too).
+      const gstinState = taxId && effectiveCountry === "IN" ? stateCodeFromGstin(taxId) : null;
+      if (taxId && effectiveCountry === "IN" && !gstinState) {
+        throw httpError(400, "The first two digits of the GSTIN are not a valid GST state code");
+      }
+      if (gstinState) {
+        const chosen = params.stateCode === undefined ? null : normalizeStateCode(params.stateCode);
+        if (chosen && chosen !== gstinState) {
+          throw httpError(400, "The state you chose does not match the first two digits of the GSTIN");
+        }
+        set("billing_state_code", gstinState);
+      }
+    }
+
+    if (params.stateCode !== undefined && effectiveCountry === "IN" && !(typeof params.taxId === "string" && params.taxId.trim())) {
+      const stateCode = params.stateCode === null || params.stateCode === "" ? null : normalizeStateCode(params.stateCode);
+      if (params.stateCode !== null && params.stateCode !== "" && !stateCode) {
+        throw httpError(400, "stateCode must be a valid GST state code (for example 27 for Maharashtra)");
+      }
+      // With a GSTIN on file the state must stay the GSTIN's state.
+      const gstinOnFile = params.taxId === undefined ? current.taxId : null;
+      const gstinState = gstinOnFile ? stateCodeFromGstin(gstinOnFile) : null;
+      if (gstinState && stateCode !== gstinState) {
+        throw httpError(400, "The state must match the GSTIN on your billing details. Remove or change the GSTIN first.");
+      }
+      set("billing_state_code", stateCode);
+    }
+
+    if (params.name !== undefined) {
+      const name = typeof params.name === "string" ? params.name.trim() : "";
+      if (name.length > 200) throw httpError(400, "Billing name must be 200 characters or fewer");
+      set("billing_name", name || null);
+    }
+
+    if (params.address !== undefined) {
+      if (params.address !== null && (typeof params.address !== "object" || Array.isArray(params.address))) {
+        throw httpError(400, "address must be an object");
+      }
+      const input = (params.address ?? {}) as Record<string, unknown>;
+      const address: Record<string, string> = {};
+      for (const field of ADDRESS_FIELDS) {
+        const value = input[field];
+        if (value === undefined || value === null || value === "") continue;
+        if (typeof value !== "string" || value.length > 200) {
+          throw httpError(400, `address.${field} must be text of 200 characters or fewer`);
+        }
+        address[field] = value.trim();
+      }
+      set("billing_address", Object.keys(address).length > 0 ? JSON.stringify(address) : null);
+    }
+
+    if (updates.length > 0) {
+      values.push(params.tenantId);
+      await query(`UPDATE tenants SET ${updates.join(", ")}, updated_at = now() WHERE id = $${values.length}`, values);
+      await AuditService.record({
+        tenantId: params.tenantId,
+        userId: params.actorId,
+        userEmail: params.actorEmail,
+        action: "billing.profile.update",
+        resourceType: "tenant",
+        resourceId: params.tenantId,
+        // Field names only: the values (tax id, address) are personal data and stay out of the audit log.
+        details: { fields: updates.map((u) => u.split(" = ")[0]) },
+        ipAddress: params.ipAddress,
+      });
+    }
+
+    return this.getBillingProfile(params.tenantId);
+  }
+
+  /**
    * Retrieves live usage consumption vs allocated plan quotas for a workspace.
    */
   public static async getUsageAndQuotas(tenantId: string): Promise<WorkspaceUsageSummary> {
+    const billing = await this.getBillingProfile(tenantId);
+
     // 1. Fetch tenant metadata
     const tenant = await queryOne<{
       id: string;
@@ -207,27 +421,14 @@ export class BillingService {
     try {
       const platformPlans = await listPlatformPlans({ publicOnly: true });
       if (platformPlans && platformPlans.length > 0) {
-        dbPlans = platformPlans.map((p) => ({
-          id: p.id,
-          name: p.name,
-          description: p.description || "",
-          priceMonthly: p.priceMonthly,
-          priceYearly: p.priceYearly,
-          currency: p.currency,
-          maxChannels: p.maxChannels,
-          maxContacts: p.maxContacts,
-          maxMonthlyMessages: p.maxMonthlyMessages,
-          maxMonthlyAiQueries: p.maxMonthlyAiQueries,
-          features: p.features,
-          badgeText: p.badgeText,
-        }));
+        dbPlans = platformPlans.map((p) => toPlanConfig(p, billing.currency));
       }
     } catch (err: any) {
       log.warn("Failed to fetch platform plans from DB, using fallback", { error: err.message });
     }
 
     if (dbPlans.length === 0) {
-      dbPlans = Object.values(PLAN_TIERS);
+      dbPlans = Object.values(PLAN_TIERS).map((p) => ({ ...p, currency: billing.currency }));
     }
 
     const currentPlanKey = (tenant.plan || tenant.plan_status || "pro").toLowerCase();
@@ -297,6 +498,7 @@ export class BillingService {
 
     // Helper for metric calculations
     const calcMetric = (used: number, limit: number, unit: string): UsageMetric => {
+      if (limit === UNLIMITED) return { used, limit, percentage: 0, unit };
       const safeLimit = Math.max(limit, 1);
       const percentage = Math.min(Math.round((used / safeLimit) * 100), 100);
       return { used, limit, percentage, unit };
@@ -319,6 +521,15 @@ export class BillingService {
       planStatus: tenant.plan_status || "active",
       planExpiresAt: tenant.plan_expires_at,
       billingCycleEnd: cycleEndIso,
+      billingCountry: billing.country,
+      billingCurrency: billing.currency,
+      currencyLocked: billing.currencyLocked,
+      tax: (() => {
+        const sample = computeTax(100, billing.currency, billing.country);
+        return { ratePercent: sample.taxRate, label: sample.taxLabel };
+      })(),
+      features: (await getEntitlements(tenantId))?.features ?? ALL_FEATURES_ON,
+      enforcement: enforcementMode(),
       metrics: {
         channels: calcMetric(activeChannels, maxChannels, "channels"),
         contacts: calcMetric(totalContacts, maxContacts, "contacts"),
@@ -336,327 +547,152 @@ export class BillingService {
   }
 
   /**
-   * Resolves plan configuration by ID either from DB or static fallback.
+   * What an upgrade would cost RIGHT NOW, shown before the customer pays: the new plan with GST, the credit for the
+   * unused time of the current plan, and what is left to pay. The checkout computes the same numbers again and fixes
+   * them, so this is a preview, never a promise.
    */
-  public static async resolvePlan(planId: string): Promise<PlanConfig | null> {
-    try {
-      const dbPlan = await getPlatformPlanById(planId);
-      if (dbPlan) {
-        return {
-          id: dbPlan.id,
-          name: dbPlan.name,
-          description: dbPlan.description || "",
-          priceMonthly: dbPlan.priceMonthly,
-          priceYearly: dbPlan.priceYearly,
-          currency: dbPlan.currency,
-          maxChannels: dbPlan.maxChannels,
-          maxContacts: dbPlan.maxContacts,
-          maxMonthlyMessages: dbPlan.maxMonthlyMessages,
-          maxMonthlyAiQueries: dbPlan.maxMonthlyAiQueries,
-          features: dbPlan.features,
-          badgeText: dbPlan.badgeText,
-        };
-      }
-    } catch (err: any) {
-      log.warn("Failed resolving plan from DB", { planId, error: err.message });
-    }
+  public static async getUpgradeQuote(tenantId: string, planId: string, billingCycle: "monthly" | "yearly") {
+    const billing = await this.getBillingProfile(tenantId);
+    const plan = await this.resolvePlan(planId, billing.currency);
+    if (!plan) throw httpError(404, `Plan '${planId}' was not found.`);
+    if (!plan.priceAvailable) throw httpError(400, `The ${plan.name} plan has no ${billing.currency} price yet.`);
 
-    return PLAN_TIERS[planId.toLowerCase()] || null;
+    const monthly = plan.priceMonthly || 0;
+    const subtotal = billingCycle === "yearly" ? (plan.priceYearly ?? monthly * 10) : monthly;
+    const tax = computeTax(subtotal, billing.currency, billing.country, {
+      buyerStateCode: billing.stateCode,
+      sellerStateCode: sellerDetails().stateCode,
+      buyerTaxId: billing.taxId,
+    });
+    const assessment = await assessUpgrade({
+      tenantId,
+      newPlanId: plan.id,
+      newBillingCycle: billingCycle,
+      newSubtotal: tax.subtotal,
+      newTotal: tax.total,
+      currency: billing.currency,
+    });
+    const credit = assessment.kind === "credit" ? assessment.credit : null;
+    const payable = Math.round((tax.total - (credit?.total ?? 0)) * 100) / 100;
+    return {
+      currency: billing.currency,
+      planId: plan.id,
+      planName: plan.name,
+      billingCycle,
+      subtotal: tax.subtotal,
+      taxAmount: tax.taxAmount,
+      taxRate: tax.taxRate,
+      taxLabel: tax.taxLabel,
+      /** The full invoice for the new plan. */
+      invoiceTotal: tax.total,
+      credit,
+      /** What is charged now. */
+      payable,
+      /** Why the change is not possible right now (null when it is). */
+      blocked: assessment.kind === "blocked" ? { reason: assessment.reason, message: assessment.message, activeUntil: assessment.activeUntil } : null,
+    };
   }
 
   /**
-   * Initializes a payment checkout session for a SaaS subscription upgrade.
+   * Resolves a plan from the database, priced in `currency`. There is deliberately no static fallback:
+   * a plan that is not in the database must never be purchasable (or activated for free).
+   */
+  public static async resolvePlan(
+    planId: string,
+    currency: BillingCurrency = DEFAULT_BILLING_CURRENCY
+  ): Promise<PlanConfig | null> {
+    try {
+      const dbPlan = await getPlatformPlanById(planId);
+      return dbPlan ? toPlanConfig(dbPlan, currency) : null;
+    } catch (err: any) {
+      log.warn("Failed resolving plan from DB", { planId, error: err.message });
+      return null;
+    }
+  }
+
+  /**
+   * The gateway is decided here, never by the browser: the workspace's currency picks Razorpay or Stripe.
+   * With BILLING_SANDBOX=true (development only, refused in production) every paid checkout uses the simulated
+   * gateway instead, so the whole flow can be tried without payment-provider keys.
+   */
+  private static pickGateway(currency: BillingCurrency): "stripe" | "razorpay" | "sandbox" {
+    if (sandboxEnabled()) return "sandbox";
+    return gatewayForCurrency(currency);
+  }
+
+  /**
+   * Starts a plan purchase. The price (in the workspace's currency, plus GST for India) and the gateway are
+   * decided here on the server; the browser only says which plan and billing cycle it wants.
+   * A free plan is activated immediately; a paid one returns a gateway URL, and the plan only changes once
+   * the provider confirms the payment (webhook or `getCheckoutStatus`).
    */
   public static async createCheckoutSession(params: CreateCheckoutSessionParams): Promise<CheckoutSessionResult> {
-    const {
-      tenantId,
-      actorId,
-      actorEmail,
-      planId,
-      billingCycle = "monthly",
-      gateway = "stripe",
-      successUrl,
-      cancelUrl,
-    } = params;
+    const { tenantId, actorId, actorEmail, planId, billingCycle = "monthly", autoRenew = false } = params;
 
-    const plan = await this.resolvePlan(planId);
+    const billing = await this.getBillingProfile(tenantId);
+    const currency = billing.currency;
+    const plan = await this.resolvePlan(planId, currency);
     if (!plan) {
-      throw new Error(`Plan tier '${planId}' not recognized.`);
+      throw httpError(404, `Plan '${planId}' was not found.`);
+    }
+    if (!plan.priceAvailable) {
+      throw httpError(400, `The ${plan.name} plan has no ${currency} price yet. Please contact support.`);
     }
 
-    const priceMonthly = plan.priceMonthly || 0;
-    const priceYearly = plan.priceYearly !== undefined ? plan.priceYearly : priceMonthly * 10;
-    const amount = billingCycle === "yearly" ? priceYearly : priceMonthly;
-    const currency = (plan.currency || "USD").toUpperCase();
+    const monthly = plan.priceMonthly || 0;
+    const subtotal = billingCycle === "yearly" ? (plan.priceYearly ?? monthly * 10) : monthly;
 
-    // Free plan check - activate immediately
-    if (amount <= 0) {
-      const result = await recordSubscriptionPayment({
+    if (subtotal <= 0) {
+      const activated = await recordSubscriptionPayment({
         tenantId,
         planId: plan.id,
         amount: 0,
         currency,
         billingCycle,
         paymentMethod: "free_tier",
+        gateway: "free",
         transactionReference: `free_${uuidv4().substring(0, 8)}`,
-        notes: `Free sandbox plan activated by ${actorEmail || actorId}`,
+        notes: `Free plan activated by ${actorEmail || actorId}`,
         sendReceiptEmail: false,
       });
-
       return {
         sessionId: `free_act_${uuidv4().substring(0, 8)}`,
-        gateway: "sandbox",
+        gateway: "free",
         planId: plan.id,
         planName: plan.name,
-        amount: 0,
-        currency,
         billingCycle,
+        currency,
+        subtotal: 0,
+        taxAmount: 0,
+        taxRate: 0,
+        taxLabel: null,
+        amount: 0,
+        invoiceTotal: 0,
+        credit: null,
+        autoRenew: false,
         isFree: true,
         isSandbox: false,
-        notes: "Free tier activated immediately without charge.",
+        notes: "Free plan activated immediately without charge.",
+        activated,
       };
     }
 
-    // Stripe Gateway Session
-    if (gateway === "stripe") {
-      const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
-      if (stripeSecretKey) {
-        try {
-          const unitAmount = Math.round(amount * 100);
-          const bodyParams = new URLSearchParams();
-          bodyParams.append("mode", "payment");
-          bodyParams.append("line_items[0][price_data][currency]", currency.toLowerCase());
-          bodyParams.append(
-            "line_items[0][price_data][product_data][name]",
-            `Omni Platform - ${plan.name} Plan (${billingCycle.toUpperCase()})`
-          );
-          bodyParams.append("line_items[0][price_data][unit_amount]", String(unitAmount));
-          bodyParams.append("line_items[0][quantity]", "1");
-          bodyParams.append("client_reference_id", tenantId);
-          bodyParams.append("metadata[tenantId]", tenantId);
-          bodyParams.append("metadata[planId]", plan.id);
-          bodyParams.append("metadata[billingCycle]", billingCycle);
-          bodyParams.append("metadata[actorId]", actorId || "");
-          bodyParams.append("metadata[actorEmail]", actorEmail || "");
-          bodyParams.append("metadata[purpose]", "saas_subscription");
-          bodyParams.append("success_url", successUrl || "https://omni-platform.ad96.in/settings?checkout=success");
-          bodyParams.append("cancel_url", cancelUrl || "https://omni-platform.ad96.in/settings?checkout=cancel");
-
-          const response = await fetch("https://api.stripe.com/v1/checkout/sessions", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/x-www-form-urlencoded",
-              Authorization: `Bearer ${stripeSecretKey}`,
-            },
-            body: bodyParams.toString(),
-          });
-
-          const resJson = (await response.json()) as any;
-          if (response.ok && resJson.id) {
-            return {
-              sessionId: resJson.id,
-              checkoutUrl: resJson.url,
-              gateway: "stripe",
-              planId: plan.id,
-              planName: plan.name,
-              amount,
-              currency,
-              billingCycle,
-              isFree: false,
-              isSandbox: false,
-            };
-          }
-          log.warn("Stripe checkout session creation failed, using sandbox fallback", { error: resJson?.error });
-        } catch (err: any) {
-          log.warn("Stripe API fetch error, using sandbox fallback", { error: err.message });
-        }
-      }
-
-      // Fallback sandbox simulation for Stripe
-      const fallbackSessionId = `cs_sub_test_${uuidv4().replace(/-/g, "").substring(0, 24)}`;
-      return {
-        sessionId: fallbackSessionId,
-        checkoutUrl: successUrl || "/settings?checkout=success",
-        gateway: "stripe",
-        planId: plan.id,
-        planName: plan.name,
-        amount,
-        currency,
-        billingCycle,
-        isFree: false,
-        isSandbox: true,
-        notes: "Stripe test mode initialized (sandbox simulation active)",
-      };
-    }
-
-    // Razorpay Gateway Session
-    if (gateway === "razorpay") {
-      const keyId = process.env.RAZORPAY_KEY_ID;
-      const keySecret = process.env.RAZORPAY_KEY_SECRET;
-      if (keyId && keySecret) {
-        try {
-          const authHeader = `Basic ${Buffer.from(`${keyId}:${keySecret}`).toString("base64")}`;
-          const amountInSubunits = Math.round(amount * 100);
-          const rzpPayload = {
-            amount: amountInSubunits,
-            currency: currency === "USD" ? "USD" : currency,
-            accept_partial: false,
-            description: `Omni Platform - ${plan.name} Plan (${billingCycle})`,
-            notify: { sms: false, email: false },
-            notes: {
-              tenantId,
-              planId: plan.id,
-              billingCycle,
-              actorId: actorId || "",
-              purpose: "saas_subscription",
-            },
-            callback_url: successUrl,
-            callback_method: "get",
-          };
-
-          const response = await fetch("https://api.razorpay.com/v1/payment_links", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: authHeader,
-            },
-            body: JSON.stringify(rzpPayload),
-          });
-
-          const resJson = (await response.json()) as any;
-          if (response.ok && resJson.id) {
-            return {
-              sessionId: resJson.id,
-              paymentLink: resJson.short_url || resJson.url,
-              gateway: "razorpay",
-              planId: plan.id,
-              planName: plan.name,
-              amount,
-              currency,
-              billingCycle,
-              isFree: false,
-              isSandbox: false,
-            };
-          }
-          log.warn("Razorpay link creation failed, using sandbox fallback", { error: resJson?.error });
-        } catch (err: any) {
-          log.warn("Razorpay API fetch error, using sandbox fallback", { error: err.message });
-        }
-      }
-
-      // Fallback sandbox simulation for Razorpay
-      const fallbackLinkId = `plink_sub_test_${uuidv4().replace(/-/g, "").substring(0, 16)}`;
-      return {
-        sessionId: fallbackLinkId,
-        paymentLink: "#",
-        gateway: "razorpay",
-        planId: plan.id,
-        planName: plan.name,
-        amount,
-        currency,
-        billingCycle,
-        isFree: false,
-        isSandbox: true,
-        notes: "Razorpay test mode initialized (sandbox simulation active)",
-      };
-    }
-
-    // Default Sandbox Gateway
-    const sandboxSessionId = `sub_sandbox_${uuidv4().substring(0, 12)}`;
-    return {
-      sessionId: sandboxSessionId,
-      gateway: "sandbox",
-      planId: plan.id,
-      planName: plan.name,
-      amount,
-      currency,
-      billingCycle,
-      isFree: false,
-      isSandbox: true,
-      notes: "Platform Sandbox Checkout (Instant 1-Click Payment Simulation)",
-    };
-  }
-
-  /**
-   * Verifies payment completion, registers immutable payment ledger entry,
-   * generates invoice, updates quotas and expiration, and sends receipt email.
-   */
-  public static async verifyPaymentAndUpgrade(params: VerifyPaymentParams): Promise<{
-    success: boolean;
-    message: string;
-    payment: any;
-    subscription: any;
-  }> {
-    const {
+    const result = await startPaidCheckout({
       tenantId,
       actorId,
       actorEmail,
-      planId,
-      billingCycle = "monthly",
-      gateway = "stripe",
-      paymentReference,
-      ipAddress,
-    } = params;
-
-    const plan = await this.resolvePlan(planId);
-    if (!plan) {
-      throw new Error(`Plan '${planId}' does not exist.`);
-    }
-
-    const priceMonthly = plan.priceMonthly || 0;
-    const priceYearly = plan.priceYearly !== undefined ? plan.priceYearly : priceMonthly * 10;
-    const amount = billingCycle === "yearly" ? priceYearly : priceMonthly;
-    const currency = (plan.currency || "USD").toUpperCase();
-
-    // Record immutable subscription payment and extend lifecycle
-    const paymentResult = await recordSubscriptionPayment({
-      tenantId,
-      planId: plan.id,
-      amount,
-      currency,
+      plan,
       billingCycle,
-      paymentMethod: gateway,
-      transactionReference: paymentReference || `tx_${uuidv4().substring(0, 12)}`,
-      notes: `Self-service subscription upgrade by ${actorEmail || actorId || "tenant administrator"} via ${gateway.toUpperCase()}`,
-      sendReceiptEmail: true,
+      billing,
+      gateway: this.pickGateway(currency),
+      autoRenew,
     });
+    return { ...result, planName: plan.name };
+  }
 
-    // Record audit trail
-    await AuditService.record({
-      tenantId,
-      userId: actorId,
-      userEmail: actorEmail,
-      action: "plan.upgrade",
-      resourceType: "subscription",
-      resourceId: paymentResult.payment.invoiceNumber,
-      details: {
-        planId: plan.id,
-        planName: plan.name,
-        amount,
-        currency,
-        billingCycle,
-        gateway,
-        invoiceNumber: paymentResult.payment.invoiceNumber,
-        expiresAt: paymentResult.subscription.planExpiresAt,
-      },
-      ipAddress,
-    });
-
-    log.info("Subscription upgraded and payment verified", {
-      tenantId,
-      planId: plan.id,
-      invoiceNumber: paymentResult.payment.invoiceNumber,
-      amount,
-      currency,
-      billingCycle,
-    });
-
-    return {
-      success: true,
-      message: `Workspace successfully upgraded to ${plan.name} (${billingCycle.toUpperCase()})!`,
-      payment: paymentResult.payment,
-      subscription: paymentResult.subscription,
-    };
+  /** Where a checkout stands; asks the provider and activates the plan if it was paid. Tenant-scoped. */
+  public static getCheckoutStatus(tenantId: string, ref: string) {
+    return getCheckoutStatus(tenantId, ref);
   }
 
   /**
@@ -669,9 +705,14 @@ export class BillingService {
     planId: string;
     ipAddress?: string;
   }): Promise<{ message: string; plan: PlanConfig }> {
-    const targetPlan = await this.resolvePlan(params.planId);
+    const billing = await this.getBillingProfile(params.tenantId);
+    const targetPlan = await this.resolvePlan(params.planId, billing.currency);
     if (!targetPlan) {
-      throw new Error(`Invalid plan tier: ${params.planId}`);
+      throw httpError(404, `Invalid plan tier: ${params.planId}`);
+    }
+    // Moving to a paid plan without paying is exactly what checkout exists to prevent.
+    if (!targetPlan.priceAvailable || targetPlan.priceMonthly > 0 || (targetPlan.priceYearly ?? 0) > 0) {
+      throw httpError(403, "Paid plans are bought through checkout.");
     }
 
     await query(
@@ -693,6 +734,7 @@ export class BillingService {
         params.tenantId,
       ]
     );
+    invalidateEntitlements(params.tenantId);
 
     // Audit log
     await AuditService.record({

@@ -2,6 +2,7 @@ import { Router, Response } from "express";
 import { requireAuth, requireRole, AuthedRequest } from "../../middleware/auth";
 import { TeamService } from "./team.service";
 import { asyncHandler } from "../../middleware/async-handler";
+import { assertFeature } from "../billing/plan-limits.service";
 
 export const teamRouter = Router();
 
@@ -40,6 +41,8 @@ teamRouter.post(
     if (!["admin", "agent", "viewer"].includes(assignedRole)) {
       return res.status(400).json({ error: "Role must be one of: admin, agent, viewer" });
     }
+    // Every plan can invite agents; choosing another role is a plan feature.
+    if (assignedRole !== "agent") await assertFeature(tenantId, "teams_roles");
 
     const created = await TeamService.inviteMember({
       tenantId,
@@ -76,6 +79,8 @@ teamRouter.patch(
     if (role === "owner" && req.auth!.role !== "owner") {
       return res.status(403).json({ error: "Only workspace owners can promote members to owner" });
     }
+    // Moving a member back to "agent" stays allowed on every plan; any other role is a plan feature.
+    if (role !== "agent") await assertFeature(tenantId, "teams_roles");
 
     const updated = await TeamService.updateRole({
       tenantId,

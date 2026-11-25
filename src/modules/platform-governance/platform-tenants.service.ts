@@ -1,3 +1,4 @@
+import { invalidateEntitlements } from "../billing/plan-limits.service";
 import { query, queryOne, withTransaction } from "../../db/pool";
 
 export interface TenantMetadata {
@@ -6,6 +7,9 @@ export interface TenantMetadata {
   plan: string;
   planStatus: "active" | "suspended" | "trial" | "cancelled" | string;
   planExpiresAt: string | null;
+  /** Currency this workspace is billed in, and the country that decided it. */
+  billingCurrency: string;
+  billingCountry: string | null;
   maxChannels: number;
   channelCount: number;
   activeChannelCount: number;
@@ -95,6 +99,8 @@ export async function listTenantsMetadata(filters: PlatformTenantFilter = {}): P
       t.plan,
       t.plan_status,
       t.plan_expires_at,
+      t.billing_currency,
+      t.billing_country,
       t.max_channels,
       t.max_contacts,
       t.max_monthly_messages,
@@ -129,6 +135,8 @@ export async function listTenantsMetadata(filters: PlatformTenantFilter = {}): P
       plan: r.plan,
       planStatus: r.plan_status || "active",
       planExpiresAt: r.plan_expires_at,
+      billingCurrency: (r.billing_currency || "USD").trim().toUpperCase(),
+      billingCountry: r.billing_country ? r.billing_country.trim() : null,
       maxChannels,
       channelCount,
       activeChannelCount: channelCount,
@@ -162,6 +170,8 @@ export async function getTenantMetadataById(tenantId: string): Promise<TenantMet
       t.plan,
       t.plan_status,
       t.plan_expires_at,
+      t.billing_currency,
+      t.billing_country,
       t.max_channels,
       t.max_contacts,
       t.max_monthly_messages,
@@ -192,6 +202,8 @@ export async function getTenantMetadataById(tenantId: string): Promise<TenantMet
     plan: r.plan,
     planStatus: r.plan_status || "active",
     planExpiresAt: r.plan_expires_at,
+      billingCurrency: (r.billing_currency || "USD").trim().toUpperCase(),
+      billingCountry: r.billing_country ? r.billing_country.trim() : null,
     maxChannels,
     channelCount,
     activeChannelCount: channelCount,
@@ -269,6 +281,7 @@ export async function updateTenantGovernance(params: {
   if (!result) {
     throw new Error(`Tenant with ID ${tenantId} not found`);
   }
+  invalidateEntitlements(tenantId);
 
   const updated = await getTenantMetadataById(tenantId);
   if (!updated) throw new Error("Failed to load updated tenant metadata");

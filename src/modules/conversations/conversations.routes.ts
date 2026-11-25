@@ -3,6 +3,7 @@ import multer from "multer";
 import { AuthedRequest, requireAuth, requireRole } from "../../middleware/auth";
 import { asyncHandler } from "../../middleware/async-handler";
 import { httpError, isUuid } from "../../utils/http-error";
+import { assertFeature } from "../billing/plan-limits.service";
 import {
   CONVERSATION_STATUSES,
   ConversationActor,
@@ -317,6 +318,8 @@ conversationsRouter.post(
     if (teamId !== null && !isUuid(teamId)) {
       throw httpError(400, "teamId must be a team id, or null to clear the team");
     }
+    // Clearing a team stays allowed on every plan; routing a chat to a support team is a plan feature.
+    if (teamId !== null) await assertFeature(req.auth!.tenantId, "teams_roles");
     await assignTeam(req.auth!.tenantId, conversationIdOf(req), teamId, actorOf(req));
     res.status(204).send();
   })

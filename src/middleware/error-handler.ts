@@ -54,7 +54,7 @@ export function errorHandler(
     : isUploadError
       ? "The file upload was invalid."
       : err?.message || "Client request error";
-  const errorMessage = statusCode < 500
+  const errorMessage = statusCode < 500 || err?.expose === true
     ? clientMessage
     : (process.env.NODE_ENV === "development" ? (err?.message || "Internal server error") : "Internal server error");
 
@@ -108,6 +108,7 @@ export function errorHandler(
     error: errorMessage,
     code: clientErrorCode || err?.code || (statusCode === 401 ? "UNAUTHORIZED" : statusCode === 403 ? "FORBIDDEN" : statusCode === 404 ? "NOT_FOUND" : statusCode === 400 ? "BAD_REQUEST" : "INTERNAL_SERVER_ERROR"),
     requestId: reqId,
+    ...(err?.details && typeof err.details === "object" && statusCode < 500 ? err.details : {}),
     ...(process.env.NODE_ENV === "development" && err?.stack && statusCode >= 500 ? { stack: err.stack } : {}),
   });
 }

@@ -9,6 +9,7 @@ import {
 } from "./ai.types";
 import { AIProvider, ChatMessage } from "./ai.provider";
 import { logger } from "../../utils/logger";
+import { assertAiAllowed } from "../billing/plan-limits.service";
 
 const log = logger.child({ module: "copilot-service" });
 
@@ -21,6 +22,7 @@ export class CopilotService {
     conversationId: string,
     customContext?: string
   ): Promise<CopilotSuggestResult> {
+    await assertAiAllowed(tenantId);
     const startTime = Date.now();
 
     // 1. Fetch recent messages
@@ -149,6 +151,7 @@ Output MUST be a JSON object with this exact structure:
     tenantId: string,
     conversationId: string
   ): Promise<CopilotSummarizeResult> {
+    await assertAiAllowed(tenantId);
     const startTime = Date.now();
 
     // 1. Fetch conversation history
@@ -250,6 +253,7 @@ Output MUST be a JSON object with this exact structure:
     tone: CopilotTone = "professional",
     targetLanguage?: string
   ): Promise<CopilotRephraseResult> {
+    await assertAiAllowed(tenantId);
     const startTime = Date.now();
 
     let instruction = "";
@@ -317,6 +321,7 @@ Output MUST be a JSON object with this exact structure:
     tenantId: string,
     text: string
   ): Promise<IntentClassificationResult> {
+    await assertAiAllowed(tenantId);
     const startTime = Date.now();
 
     const systemPrompt = `You are an AI Intent Classifier for customer conversations.

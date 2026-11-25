@@ -121,6 +121,24 @@ export async function getMediaObject(key: string, range?: string): Promise<Media
   };
 }
 
+// Invoices and credit notes (plan/018) are tax records that must be kept for years. They default to the media
+// bucket under an `invoices/` prefix that no media route can read; set INVOICE_S3_BUCKET to keep them in a
+// bucket with its own retention rules (the media bucket may have lifecycle rules that expire old files).
+const INVOICE_BUCKET = process.env.INVOICE_S3_BUCKET || BUCKET;
+
+export async function uploadInvoiceObject(params: { key: string; body: Buffer }): Promise<void> {
+  await getS3Client().send(
+    new PutObjectCommand({ Bucket: INVOICE_BUCKET, Key: params.key, Body: params.body, ContentType: "application/pdf" })
+  );
+}
+
+export async function getInvoiceObject(key: string): Promise<Buffer> {
+  const res = await getS3Client().send(new GetObjectCommand({ Bucket: INVOICE_BUCKET, Key: key }));
+  const body = res.Body as { transformToByteArray?: () => Promise<Uint8Array> } | undefined;
+  if (!body?.transformToByteArray) throw new Error("Invoice object has no readable body");
+  return Buffer.from(await body.transformToByteArray());
+}
+
 /** Removes an uploaded object, e.g. when the message it was uploaded for could not be sent. */
 export async function deleteMedia(key: string): Promise<void> {
   const s3 = getS3Client();

@@ -1,5 +1,6 @@
 import { Router, Response } from "express";
 import { AuthedRequest, requireAuth, requireRole } from "../../middleware/auth";
+import { requireFeature } from "../billing/plan-limits.service";
 import { asyncHandler } from "../../middleware/async-handler";
 import { httpError, isUuid } from "../../utils/http-error";
 import {
@@ -14,6 +15,12 @@ import {
 
 export const teamsRouter = Router();
 teamsRouter.use(requireAuth);
+// Support teams are a plan feature. Reading the auto-assign mode stays open to every plan: the flow builder shows it.
+const requireTeamsFeature = requireFeature("teams_roles");
+teamsRouter.use((req, res, next) => {
+  if (req.method === "GET" && req.path === "/settings") return next();
+  return requireTeamsFeature(req, res, next);
+});
 
 const actorOf = (req: AuthedRequest) => ({
   userId: req.auth!.userId,

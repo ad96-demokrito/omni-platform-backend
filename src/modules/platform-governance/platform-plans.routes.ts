@@ -13,6 +13,7 @@ import {
   updatePlatformPlan,
   deleteOrDeactivatePlatformPlan,
 } from "./platform-plans.service";
+import { enforcementMode, listWouldBlockCounts } from "../billing/plan-limits.service";
 
 export const platformPlansRouter = Router();
 
@@ -28,6 +29,19 @@ platformPlansRouter.get(
     const includeInactive = req.query.includeInactive !== "false";
     const plans = await listPlatformPlans({ includeInactive });
     res.json(plans);
+  })
+);
+
+/**
+ * GET /api/platform/plans/enforcement-report
+ * What PLAN_ENFORCEMENT would block this month, per workspace and reason. Read this in "warn" mode before
+ * switching to "enforce" (Super Admin only).
+ */
+platformPlansRouter.get(
+  "/enforcement-report",
+  requirePlatformRole("super_admin"),
+  asyncHandler(async (_req: PlatformAuthedRequest, res: Response) => {
+    res.json({ mode: enforcementMode(), wouldBlock: await listWouldBlockCounts() });
   })
 );
 
@@ -58,6 +72,7 @@ platformPlansRouter.post(
       id,
       name,
       description,
+      prices,
       priceMonthly,
       priceYearly,
       currency,
@@ -66,21 +81,23 @@ platformPlansRouter.post(
       maxMonthlyMessages,
       maxMonthlyAiQueries,
       features,
+      featureFlags,
       badgeText,
       isActive,
       isPublic,
       isCustom,
     } = req.body;
 
-    if (!id || !name || priceMonthly === undefined) {
-      return res.status(400).json({ error: "id, name, and priceMonthly are required" });
+    if (!id || !name || (priceMonthly === undefined && !Array.isArray(prices))) {
+      return res.status(400).json({ error: "id, name, and either prices or priceMonthly are required" });
     }
 
     const newPlan = await createPlatformPlan({
       id,
       name,
       description,
-      priceMonthly: Number(priceMonthly),
+      prices: Array.isArray(prices) ? prices : undefined,
+      priceMonthly: Number(priceMonthly ?? 0),
       priceYearly: priceYearly !== undefined ? Number(priceYearly) : undefined,
       currency,
       maxChannels: Number(maxChannels || 1),
@@ -88,6 +105,7 @@ platformPlansRouter.post(
       maxMonthlyMessages: Number(maxMonthlyMessages || 2000),
       maxMonthlyAiQueries: Number(maxMonthlyAiQueries || 100),
       features,
+      featureFlags,
       badgeText,
       isActive,
       isPublic,

@@ -1,6 +1,15 @@
+import { invalidateEntitlements } from "../billing/plan-limits.service";
 import { query, queryOne, withTransaction } from "../../db/pool";
-import { emailService } from "../email/email.service";
 import { getPlatformPlanById } from "./platform-plans.service";
+import { currencyForCountry, isSupportedCurrency, normalizeCountryCode } from "../billing/currency";
+import { sellerDetails } from "../billing/config";
+import { mapPaymentRow, SubscriptionPaymentRecord } from "../billing/payment-record";
+import { isSameState, splitTaxAmount } from "../billing/gst";
+import { stateName } from "../billing/gst-states";
+import { allocateDocumentNumber, indiaMonthRange } from "../billing/invoice-number";
+import { startCreditNoteFollowUp, startInvoiceFollowUp } from "../billing/invoice-delivery.service";
+import { issueCreditNote } from "../billing/credit-notes.service";
+import { randomBytes } from "crypto";
 import { logger } from "../../utils/logger";
 
 export interface WorkspaceSubscriptionItem {
@@ -22,29 +31,16 @@ export interface WorkspaceSubscriptionItem {
   ownerName: string | null;
   lastPaymentAt: string | null;
   lastInvoiceNumber: string | null;
+  /** Currency this workspace is billed in (decides the plan price and the gateway). */
+  billingCurrency: string;
+  billingCountry: string | null;
+  /** The workspace's auto-renewing subscription: null when it has none (a prepaid plan just ends on its date). */
+  renewal: { status: "active" | "past_due"; cancelAtPeriodEnd: boolean; gateway: string } | null;
   createdAt: string;
 }
 
-export interface SubscriptionPaymentRecord {
-  id: string;
-  tenantId: string;
-  tenantName: string;
-  planId: string;
-  planName: string;
-  amount: number;
-  currency: string;
-  billingCycle: "monthly" | "yearly" | "custom" | string;
-  paymentMethod: "stripe" | "razorpay" | "bank_transfer" | "credit_card" | "manual" | "crypto" | string;
-  transactionReference: string | null;
-  status: "paid" | "pending" | "failed" | "refunded" | string;
-  invoiceNumber: string;
-  periodStart: string;
-  periodEnd: string;
-  notes: string | null;
-  recordedByStaffId: string | null;
-  recordedByName: string | null;
-  createdAt: string;
-}
+export { mapPaymentRow };
+export type { SubscriptionPaymentRecord };
 
 export async function listWorkspaceSubscriptions(filters: {
   search?: string;
@@ -104,8 +100,13 @@ export async function listWorkspaceSubscriptions(filters: {
       t.max_contacts,
       t.max_monthly_messages,
       t.max_monthly_ai_queries,
+      t.billing_country,
+      t.billing_currency,
       t.created_at,
       COALESCE(pp.name, initcap(t.plan)) as resolved_plan_name,
+      (SELECT s.status FROM tenant_subscriptions s WHERE s.tenant_id = t.id AND s.status IN ('active', 'past_due') ORDER BY s.created_at DESC LIMIT 1) as renewal_status,
+      (SELECT s.cancel_at_period_end FROM tenant_subscriptions s WHERE s.tenant_id = t.id AND s.status IN ('active', 'past_due') ORDER BY s.created_at DESC LIMIT 1) as renewal_cancelled,
+      (SELECT s.gateway FROM tenant_subscriptions s WHERE s.tenant_id = t.id AND s.status IN ('active', 'past_due') ORDER BY s.created_at DESC LIMIT 1) as renewal_gateway,
       (SELECT count(*) FROM channels c WHERE c.tenant_id = t.id AND c.status = 'active') as active_channels,
       (SELECT count(*) FROM contacts ct WHERE ct.tenant_id = t.id) as total_contacts,
       (SELECT u.email FROM users u WHERE u.tenant_id = t.id AND u.role = 'owner' LIMIT 1) as owner_email,
@@ -155,6 +156,11 @@ export async function listWorkspaceSubscriptions(filters: {
       ownerName: r.owner_name,
       lastPaymentAt: r.last_payment_at,
       lastInvoiceNumber: r.last_invoice_number,
+      billingCurrency: (r.billing_currency || "USD").trim().toUpperCase(),
+      billingCountry: r.billing_country ? r.billing_country.trim() : null,
+      renewal: r.renewal_status
+        ? { status: r.renewal_status, cancelAtPeriodEnd: Boolean(r.renewal_cancelled), gateway: r.renewal_gateway }
+        : null,
       createdAt: r.created_at,
     };
   });
@@ -243,21 +249,44 @@ export async function updateTenantSubscriptionLifecycle(params: {
   values.push(tenantId);
   const sql = `UPDATE tenants SET ${updates.join(", ")} WHERE id = $${idx}`;
   await query(sql, values);
+  invalidateEntitlements(tenantId);
 
   const res = await listWorkspaceSubscriptions({ search: tenantId, limit: 1 });
   if (res.subscriptions.length === 0) throw new Error("Failed to retrieve updated subscription");
   return res.subscriptions[0];
 }
 
-export async function generateNextInvoiceNumber(): Promise<string> {
-  const dateStr = new Date().toISOString().slice(0, 7).replace("-", ""); // YYYYMM
-  const randomSuffix = Math.floor(1000 + Math.random() * 9000);
-  const countRes = await queryOne<{ count: string }>(
-    `SELECT count(*) FROM platform_subscription_payments WHERE invoice_number LIKE $1`,
-    [`INV-${dateStr}-%`]
+/**
+ * Platform-staff override of a workspace's billing country (and so its currency), including after the
+ * currency was locked by the first paid payment. `resetLock` lets the customer change it themselves again.
+ */
+export async function setWorkspaceBillingCountry(
+  tenantId: string,
+  countryInput: unknown,
+  resetLock: boolean
+): Promise<{ billingCountry: string; billingCurrency: string; currencyLocked: boolean }> {
+  const country = normalizeCountryCode(countryInput);
+  if (!country) throw new Error("country must be a 2-letter ISO country code (for example IN or US)");
+  const currency = currencyForCountry(country);
+
+  const row = await queryOne<{ currency_locked_at: string | null }>(
+    `UPDATE tenants
+     SET billing_country = $2, billing_currency = $3,
+         currency_locked_at = CASE WHEN $4::boolean THEN NULL ELSE currency_locked_at END,
+         updated_at = now()
+     WHERE id = $1
+     RETURNING currency_locked_at`,
+    [tenantId, country, currency, resetLock]
   );
-  const seq = (parseInt(countRes?.count || "0", 10) + 1).toString().padStart(4, "0");
-  return `INV-${dateStr}-${seq}-${randomSuffix}`;
+  if (!row) throw new Error("Tenant workspace not found");
+  return { billingCountry: country, billingCurrency: currency, currencyLocked: Boolean(row.currency_locked_at) };
+}
+
+/** The buyer's address as one printable line, from the billing address the customer entered. */
+function formatBuyerAddress(address: Record<string, string> | null, country: string | null): string | null {
+  const parts = ["line1", "line2", "city", "state", "postalCode"].map((key) => address?.[key]?.trim()).filter(Boolean);
+  if (country) parts.push(country.trim());
+  return parts.length > 0 ? parts.join(", ") : null;
 }
 
 export async function recordSubscriptionPayment(params: {
@@ -275,12 +304,26 @@ export async function recordSubscriptionPayment(params: {
   sendReceiptEmail?: boolean;
   staffId?: string;
   staffName?: string;
+  /** Which provider collected it ("stripe", "razorpay", "sandbox") and its id for the payment. */
+  gateway?: string;
+  gatewayPaymentId?: string;
+  /** Tax split of `amount` (the total). Without these the whole amount is the subtotal. */
+  taxAmount?: number;
+  taxRate?: number;
+  taxLabel?: string | null;
+  buyerTaxId?: string | null;
+  sellerTaxId?: string | null;
+  /**
+   * An upgrade: credit the unused part of an earlier invoice. A credit note is issued in the same transaction as this
+   * invoice and applied to it, so `amount` stays the full invoice value and the cash collected is amount - credit.
+   */
+  credit?: { invoiceId: string; subtotal: number; tax: number; total: number };
 }): Promise<{ payment: SubscriptionPaymentRecord; subscription: WorkspaceSubscriptionItem }> {
   const {
     tenantId,
     planId,
     amount,
-    currency = "USD",
+    currency: requestedCurrency,
     billingCycle = "monthly",
     paymentMethod = "stripe",
     transactionReference,
@@ -288,10 +331,28 @@ export async function recordSubscriptionPayment(params: {
     sendReceiptEmail = true,
     staffId,
     staffName,
+    gateway,
+    gatewayPaymentId,
+    taxAmount = 0,
+    taxRate = 0,
+    taxLabel = null,
   } = params;
+  const subtotal = Math.round((Number(amount) - taxAmount) * 100) / 100;
 
-  const tenant = await queryOne<any>("SELECT id, name, plan, plan_expires_at FROM tenants WHERE id = $1", [tenantId]);
+  const tenant = await queryOne<any>(
+    `SELECT id, name, plan, plan_expires_at, billing_currency, billing_country, billing_name, billing_address,
+            billing_tax_id, billing_state_code
+     FROM tenants WHERE id = $1`,
+    [tenantId]
+  );
   if (!tenant) throw new Error("Tenant workspace not found");
+
+  // A payment is recorded in the currency it was made in; when the caller does not say, that is the
+  // workspace's billing currency (never a hard-coded USD).
+  const currency = String(requestedCurrency || tenant.billing_currency || "USD").trim().toUpperCase();
+  if (!isSupportedCurrency(currency)) {
+    throw new Error(`Unsupported currency '${currency}'. Supported: INR, USD.`);
+  }
 
   const plan = await getPlatformPlanById(planId);
   const planName = plan ? plan.name : planId.toUpperCase();
@@ -312,34 +373,107 @@ export async function recordSubscriptionPayment(params: {
     periodEndDate.setMonth(periodEndDate.getMonth() + 1);
   }
 
-  const invoiceNumber = await generateNextInvoiceNumber();
+  // Seller and buyer are frozen into the invoice now: later edits to the workspace's profile or to our own
+  // settings must never change an invoice that was already issued.
+  const seller = sellerDetails();
+  const buyerCountry = tenant.billing_country ? String(tenant.billing_country).trim().toUpperCase() : null;
+  const isIndian = currency === "INR" && buyerCountry === "IN";
+  const buyerTaxId = params.buyerTaxId !== undefined ? params.buyerTaxId : tenant.billing_tax_id ?? null;
+  const sellerTaxId = params.sellerTaxId ?? seller.taxId;
+  const supplyType = !isIndian ? "export" : buyerTaxId ? "b2b" : "b2c";
+  const buyerStateCode = isIndian && tenant.billing_state_code ? String(tenant.billing_state_code).trim() : null;
+  const taxSplit = splitTaxAmount(taxAmount, currency, isSameState(buyerStateCode, seller.stateCode));
+  const placeOfSupply = isIndian ? stateName(buyerStateCode) : `Outside India${buyerCountry ? ` (${buyerCountry})` : ""}`;
+  const issuedAt = new Date();
+  // A zero-amount record (switching to a free plan, a complimentary grant) is not a tax invoice: it must not use up
+  // a number of the gapless series, carries no tax snapshot and is never emailed.
+  const isFreeRecord = Number(amount) <= 0;
 
-  const paymentRow = await queryOne<any>(
-    `INSERT INTO platform_subscription_payments (
-       tenant_id, plan_id, plan_name, amount, currency, billing_cycle,
-       payment_method, transaction_reference, status, invoice_number,
-       period_start, period_end, notes, recorded_by_staff_id, recorded_by_name
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'paid', $9, $10, $11, $12, $13, $14)
-     RETURNING id, tenant_id, plan_id, plan_name, amount, currency, billing_cycle,
-               payment_method, transaction_reference, status, invoice_number,
-               period_start, period_end, notes, recorded_by_staff_id, recorded_by_name, created_at`,
-    [
-      tenantId,
-      planId.toLowerCase(),
-      planName,
-      amount,
-      currency.toUpperCase(),
-      billingCycle,
-      paymentMethod,
-      transactionReference || null,
-      invoiceNumber,
-      periodStartDate.toISOString(),
-      periodEndDate.toISOString(),
-      notes || null,
-      staffId || null,
-      staffName || null,
-    ]
-  );
+  // The number and the row are written in ONE transaction: if the insert fails the number is handed out again,
+  // so there are no gaps in the series (a CA and the GST rules both expect that).
+  let creditNoteId: string | null = null;
+  const paymentRow = await withTransaction(async (client) => {
+    const invoiceNumber = isFreeRecord
+      ? `FREE/${randomBytes(4).toString("hex").toUpperCase()}`
+      : await allocateDocumentNumber(client, "invoice", issuedAt);
+    const inserted = await client.query(
+      `INSERT INTO platform_subscription_payments (
+         tenant_id, plan_id, plan_name, amount, currency, billing_cycle,
+         payment_method, transaction_reference, status, invoice_number,
+         period_start, period_end, notes, recorded_by_staff_id, recorded_by_name,
+         gateway, gateway_payment_id, subtotal, tax_amount, tax_rate, tax_label, buyer_tax_id, seller_tax_id,
+         seller_name, seller_address, seller_state_code, buyer_name, buyer_address, buyer_state_code,
+         place_of_supply, sac_code, cgst_amount, sgst_amount, igst_amount, supply_type, lut_number, issued_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'paid', $9, $10, $11, $12, $13, $14,
+                 $15, $16, $17, $18, $19, $20, $21, $22,
+                 $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36)
+       RETURNING *`,
+      [
+        tenantId,
+        planId.toLowerCase(),
+        planName,
+        amount,
+        currency.toUpperCase(),
+        billingCycle,
+        paymentMethod,
+        transactionReference || null,
+        invoiceNumber,
+        periodStartDate.toISOString(),
+        periodEndDate.toISOString(),
+        notes || null,
+        staffId || null,
+        staffName || null,
+        gateway || null,
+        gatewayPaymentId || null,
+        subtotal,
+        taxAmount,
+        taxRate,
+        taxLabel,
+        buyerTaxId,
+        sellerTaxId,
+        isFreeRecord ? null : seller.legalName,
+        isFreeRecord ? null : seller.address,
+        isFreeRecord ? null : seller.stateCode,
+        isFreeRecord ? null : tenant.billing_name || tenant.name,
+        isFreeRecord ? null : formatBuyerAddress(tenant.billing_address ?? null, buyerCountry),
+        isFreeRecord ? null : buyerStateCode,
+        isFreeRecord ? null : placeOfSupply,
+        isFreeRecord ? null : seller.sacCode,
+        taxSplit.cgst,
+        taxSplit.sgst,
+        taxSplit.igst,
+        isFreeRecord ? null : supplyType,
+        !isFreeRecord && supplyType === "export" ? seller.lutNumber : null,
+        issuedAt.toISOString(),
+      ]
+    );
+    const created = inserted.rows[0];
+    if (params.credit && !isFreeRecord) {
+      creditNoteId = await issueCreditNote(client, {
+        invoiceId: params.credit.invoiceId,
+        tenantId,
+        kind: "upgrade_credit",
+        reason: `Upgrade to the ${planName} plan: unused time of the previous plan`,
+        total: params.credit.total,
+        split: { subtotal: params.credit.subtotal, tax: params.credit.tax },
+        appliedToInvoiceId: created.id,
+        issuedBy: staffName ? `staff:${staffName}` : "system",
+        issuedAt,
+      });
+      const withCredit = await client.query(
+        "UPDATE platform_subscription_payments SET credit_applied = $2 WHERE id = $1 RETURNING *",
+        [created.id, params.credit.total]
+      );
+      return withCredit.rows[0];
+    }
+    return created;
+  });
+  const invoiceNumber: string = paymentRow.invoice_number;
+
+  // The first paid payment locks the workspace's billing currency (see BillingService.updateBillingProfile).
+  if (Number(amount) > 0) {
+    await query("UPDATE tenants SET currency_locked_at = COALESCE(currency_locked_at, now()) WHERE id = $1", [tenantId]);
+  }
 
   // Extend tenant subscription & activate
   await updateTenantSubscriptionLifecycle({
@@ -355,45 +489,14 @@ export async function recordSubscriptionPayment(params: {
 
   const updatedSub = (await listWorkspaceSubscriptions({ search: tenantId, limit: 1 })).subscriptions[0];
 
-  // Optionally send transactional email receipt to tenant owner
-  if (sendReceiptEmail && updatedSub?.ownerEmail) {
-    emailService
-      .sendSubscriptionReceipt({
-        to: updatedSub.ownerEmail,
-        tenantName: tenant.name,
-        planName,
-        invoiceNumber,
-        amount: Number(amount),
-        currency: currency.toUpperCase(),
-        billingCycle,
-        periodEnd: periodEndDate.toISOString(),
-        paymentMethod,
-      })
-      .catch((err) => {
-        logger.error("[SubscriptionPayment] Failed to send receipt email:", err);
-      });
+  // The invoice PDF is created and stored, then emailed when INVOICE_EMAIL_ENABLED allows it. Both run in the
+  // background and never hold up (or fail) the payment.
+  if (!isFreeRecord) {
+    startInvoiceFollowUp(paymentRow.id, { email: sendReceiptEmail });
+    if (creditNoteId) startCreditNoteFollowUp(creditNoteId, { email: sendReceiptEmail });
   }
 
-  const paymentRecord: SubscriptionPaymentRecord = {
-    id: paymentRow.id,
-    tenantId: paymentRow.tenant_id,
-    tenantName: tenant.name,
-    planId: paymentRow.plan_id,
-    planName: paymentRow.plan_name,
-    amount: parseFloat(paymentRow.amount || "0"),
-    currency: paymentRow.currency,
-    billingCycle: paymentRow.billing_cycle,
-    paymentMethod: paymentRow.payment_method,
-    transactionReference: paymentRow.transaction_reference,
-    status: paymentRow.status,
-    invoiceNumber: paymentRow.invoice_number,
-    periodStart: paymentRow.period_start,
-    periodEnd: paymentRow.period_end,
-    notes: paymentRow.notes,
-    recordedByStaffId: paymentRow.recorded_by_staff_id,
-    recordedByName: paymentRow.recorded_by_name,
-    createdAt: paymentRow.created_at,
-  };
+  const paymentRecord = mapPaymentRow(paymentRow, tenant.name);
 
   return { payment: paymentRecord, subscription: updatedSub };
 }
@@ -402,6 +505,8 @@ export async function listSubscriptionPayments(filters: {
   tenantId?: string;
   status?: string;
   search?: string;
+  /** "YYYY-MM" in India time, by invoice issue date (or the record date for legacy rows). */
+  month?: string;
   page?: number;
   limit?: number;
 } = {}): Promise<{
@@ -410,7 +515,8 @@ export async function listSubscriptionPayments(filters: {
   page: number;
   limit: number;
   totalPages: number;
-  totalRevenue: number;
+  /** Paid revenue per currency. Currencies are never added together. */
+  revenueByCurrency: Record<string, number>;
 }> {
   const page = Math.max(1, filters.page || 1);
   const limit = Math.min(100, Math.max(1, filters.limit || 20));
@@ -430,6 +536,16 @@ export async function listSubscriptionPayments(filters: {
     params.push(filters.status);
   }
 
+  if (filters.month) {
+    const range = indiaMonthRange(filters.month);
+    if (!range) throw new Error("month must look like 2026-11");
+    conditions.push(
+      `COALESCE(psp.issued_at, psp.created_at) >= $${idx} AND COALESCE(psp.issued_at, psp.created_at) < $${idx + 1}`
+    );
+    params.push(range.from.toISOString(), range.to.toISOString());
+    idx += 2;
+  }
+
   if (filters.search && filters.search.trim()) {
     conditions.push(`(psp.invoice_number ILIKE $${idx} OR t.name ILIKE $${idx} OR psp.transaction_reference ILIKE $${idx})`);
     params.push(`%${filters.search.trim()}%`);
@@ -443,35 +559,23 @@ export async function listSubscriptionPayments(filters: {
       `SELECT count(*) FROM platform_subscription_payments psp JOIN tenants t ON t.id = psp.tenant_id ${whereClause}`,
       params
     ),
-    queryOne<{ total_revenue: string }>(
-      `SELECT coalesce(sum(psp.amount), 0) as total_revenue FROM platform_subscription_payments psp JOIN tenants t ON t.id = psp.tenant_id ${whereClause} AND psp.status = 'paid'`,
+    query<{ currency: string; total_revenue: string }>(
+      `SELECT psp.currency, coalesce(sum(psp.amount), 0) as total_revenue
+       FROM platform_subscription_payments psp JOIN tenants t ON t.id = psp.tenant_id
+       ${whereClause ? `${whereClause} AND` : "WHERE"} psp.status = 'paid'
+       GROUP BY psp.currency`,
       params
     ),
   ]);
 
   const total = parseInt(countRes?.count || "0", 10);
-  const totalRevenue = parseFloat(revenueRes?.total_revenue || "0");
+  const revenueByCurrency: Record<string, number> = {};
+  for (const row of revenueRes) {
+    revenueByCurrency[String(row.currency).trim().toUpperCase()] = parseFloat(row.total_revenue || "0");
+  }
 
   const sql = `
-    SELECT
-      psp.id,
-      psp.tenant_id,
-      t.name as tenant_name,
-      psp.plan_id,
-      psp.plan_name,
-      psp.amount,
-      psp.currency,
-      psp.billing_cycle,
-      psp.payment_method,
-      psp.transaction_reference,
-      psp.status,
-      psp.invoice_number,
-      psp.period_start,
-      psp.period_end,
-      psp.notes,
-      psp.recorded_by_staff_id,
-      psp.recorded_by_name,
-      psp.created_at
+    SELECT psp.*, t.name AS tenant_name
     FROM platform_subscription_payments psp
     JOIN tenants t ON t.id = psp.tenant_id
     ${whereClause}
@@ -482,26 +586,7 @@ export async function listSubscriptionPayments(filters: {
   params.push(limit, offset);
   const rows = await query<any>(sql, params);
 
-  const payments: SubscriptionPaymentRecord[] = rows.map((r) => ({
-    id: r.id,
-    tenantId: r.tenant_id,
-    tenantName: r.tenant_name,
-    planId: r.plan_id,
-    planName: r.plan_name,
-    amount: parseFloat(r.amount || "0"),
-    currency: r.currency,
-    billingCycle: r.billing_cycle,
-    paymentMethod: r.payment_method,
-    transactionReference: r.transaction_reference,
-    status: r.status,
-    invoiceNumber: r.invoice_number,
-    periodStart: r.period_start,
-    periodEnd: r.period_end,
-    notes: r.notes,
-    recordedByStaffId: r.recorded_by_staff_id,
-    recordedByName: r.recorded_by_name,
-    createdAt: r.created_at,
-  }));
+  const payments: SubscriptionPaymentRecord[] = rows.map((r) => mapPaymentRow(r, r.tenant_name));
 
   return {
     payments,
@@ -509,6 +594,6 @@ export async function listSubscriptionPayments(filters: {
     page,
     limit,
     totalPages: Math.ceil(total / limit),
-    totalRevenue,
+    revenueByCurrency,
   };
 }
